@@ -632,6 +632,7 @@ def build_agent_chat_executor(config=None, skills: Optional[List[str]] = None):
 
     from src.agent.agent_backend import (
         AgentBackendConfigError,
+        CodexOAuthAgentBackend,
         LiteLLMAgentBackend,
         resolve_agent_backend_id,
     )
@@ -657,6 +658,13 @@ def build_agent_chat_executor(config=None, skills: Optional[List[str]] = None):
 
         context_llm_adapter = LLMToolAdapter(config)
         backend = LiteLLMAgentBackend(registry, context_llm_adapter)
+    elif backend_id == "codex_oauth":
+        from src.agent.codex_oauth_adapter import CodexOAuthToolAdapter
+
+        # DSA still owns the loop here, so the same adapter also serves the
+        # conversation-summary path the LiteLLM backend uses it for.
+        context_llm_adapter = CodexOAuthToolAdapter(config)
+        backend = CodexOAuthAgentBackend(registry, context_llm_adapter)
     else:
         from src.agent.codex_agent_backend import CodexAgentBackend
         from src.agent.tool_surface import ToolSurface

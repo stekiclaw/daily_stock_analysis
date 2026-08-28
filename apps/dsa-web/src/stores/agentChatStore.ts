@@ -55,7 +55,7 @@ export interface StreamMeta {
 
 export interface StreamAcceptedEvent {
   type: 'accepted';
-  backend: 'litellm' | 'codex_app_server';
+  backend: 'litellm' | 'codex_app_server' | 'codex_oauth';
   request_id: string;
   session_id: string;
 }
@@ -378,7 +378,9 @@ export const useAgentChatStore = create<AgentChatState & AgentChatActions>((set,
             throw protocolError('Agent stream emitted accepted more than once.');
           }
           if (
-            (event.backend !== 'litellm' && event.backend !== 'codex_app_server')
+            (event.backend !== 'litellm'
+              && event.backend !== 'codex_app_server'
+              && event.backend !== 'codex_oauth')
             || event.request_id !== requestId
             || event.session_id !== streamSessionId
           ) {

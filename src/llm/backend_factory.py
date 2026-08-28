@@ -5,7 +5,11 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from src.llm.backend_registry import LOCAL_CLI_GENERATION_BACKEND_IDS, LITELLM_BACKEND_ID
+from src.llm.backend_registry import (
+    CODEX_OAUTH_BACKEND_ID,
+    LOCAL_CLI_GENERATION_BACKEND_IDS,
+    LITELLM_BACKEND_ID,
+)
 from src.llm.generation_backend import GenerationBackend, GenerationError, GenerationErrorCode
 from src.llm.litellm_backend import LiteLLMCallable, LiteLLMGenerationBackend
 from src.llm.local_cli_backend import LocalCliGenerationBackend
@@ -34,6 +38,11 @@ def create_generation_backend(
         return LiteLLMGenerationBackend(litellm_completion_callable)
     if normalized in LOCAL_CLI_GENERATION_BACKEND_IDS:
         return LocalCliGenerationBackend(config, preset_id=normalized)
+    if normalized == CODEX_OAUTH_BACKEND_ID:
+        # Imported lazily so the LiteLLM-only path does not pay for it.
+        from src.llm.codex_oauth_backend import CodexOAuthGenerationBackend
+
+        return CodexOAuthGenerationBackend(config)
 
     raise GenerationError(
         error_code=GenerationErrorCode.BACKEND_NOT_CONFIGURED,

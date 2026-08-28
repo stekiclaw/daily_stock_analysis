@@ -130,8 +130,17 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             {"label": "Codex CLI (experimental)", "value": "codex_cli"},
             {"label": "Claude Code CLI (experimental)", "value": "claude_code_cli"},
             {"label": "OpenCode CLI (experimental)", "value": "opencode_cli"},
+            {"label": "OpenAI-OAuth (ChatGPT/Codex subscription)", "value": "codex_oauth"},
         ],
-        "validation": {"enum": ["litellm", "codex_cli", "claude_code_cli", "opencode_cli"]},
+        "validation": {
+            "enum": [
+                "litellm",
+                "codex_cli",
+                "claude_code_cli",
+                "opencode_cli",
+                "codex_oauth",
+            ]
+        },
         "display_order": 0,
         "help_key": "settings.ai_model.GENERATION_BACKEND",
         "examples": [
@@ -139,7 +148,115 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             "GENERATION_BACKEND=codex_cli",
             "GENERATION_BACKEND=claude_code_cli",
             "GENERATION_BACKEND=opencode_cli",
+            "GENERATION_BACKEND=codex_oauth",
         ],
+        "docs": [
+            {
+                "label": "LLM 配置指南",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/LLM_CONFIG_GUIDE.md",
+            },
+        ],
+        "warning_codes": [],
+    },
+    "CODEX_OAUTH_MODEL": {
+        "title": "OpenAI-OAuth Model",
+        "description": "Model used when the analysis generation method is OpenAI-OAuth.",
+        "category": "ai_model",
+        "data_type": "string",
+        "ui_control": "text",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "gpt-5.6-terra",
+        "display_order": 1,
+        "help_key": "settings.ai_model.CODEX_OAUTH_MODEL",
+        "examples": [
+            "CODEX_OAUTH_MODEL=gpt-5.6-terra",
+            "CODEX_OAUTH_MODEL=gpt-5.6-sol",
+            "CODEX_OAUTH_MODEL=gpt-5.6-luna",
+        ],
+        "docs": [
+            {
+                "label": "LLM 配置指南",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/LLM_CONFIG_GUIDE.md",
+            },
+        ],
+        "warning_codes": [],
+    },
+    "AGENT_CODEX_OAUTH_MODEL": {
+        "title": "Ask-Stock OpenAI-OAuth Model",
+        "description": (
+            "Model the ask-stock Agent uses when its backend is OpenAI-OAuth. "
+            "Leave empty to inherit CODEX_OAUTH_MODEL, or set it to run ask-stock "
+            "on a different model than report generation."
+        ),
+        "category": "agent",
+        "data_type": "string",
+        "ui_control": "text",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": None,
+        "options": [],
+        "validation": {},
+        "display_order": 3,
+        "help_key": "settings.agent.AGENT_CODEX_OAUTH_MODEL",
+        "examples": [
+            "AGENT_CODEX_OAUTH_MODEL=gpt-5.6-terra",
+            "AGENT_CODEX_OAUTH_MODEL=gpt-5.6-sol",
+        ],
+        "docs": [
+            {
+                "label": "LLM 配置指南",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/LLM_CONFIG_GUIDE.md",
+            },
+        ],
+        "warning_codes": [],
+    },
+    "CODEX_OAUTH_REASONING_EFFORT": {
+        "title": "OpenAI-OAuth Reasoning Effort",
+        "description": "Reasoning effort passed to the OpenAI-OAuth generation backend.",
+        "category": "ai_model",
+        "data_type": "string",
+        "ui_control": "select",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "medium",
+        "options": [
+            {"label": "None", "value": "none"},
+            {"label": "Low", "value": "low"},
+            {"label": "Medium", "value": "medium"},
+            {"label": "High", "value": "high"},
+        ],
+        "validation": {"enum": ["none", "low", "medium", "high"]},
+        "display_order": 2,
+        "help_key": "settings.ai_model.CODEX_OAUTH_REASONING_EFFORT",
+        "examples": ["CODEX_OAUTH_REASONING_EFFORT=medium"],
+        "docs": [
+            {
+                "label": "LLM 配置指南",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/LLM_CONFIG_GUIDE.md",
+            },
+        ],
+        "warning_codes": [],
+    },
+    "CODEX_OAUTH_AUTH_FILE": {
+        "title": "OpenAI-OAuth Credential Path",
+        "description": (
+            "Where the OAuth credential is stored. Keep it inside a mounted volume so "
+            "the authorization survives container rebuilds."
+        ),
+        "category": "ai_model",
+        "data_type": "string",
+        "ui_control": "text",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "data/codex_oauth/auth.json",
+        "display_order": 3,
+        "help_key": "settings.ai_model.CODEX_OAUTH_AUTH_FILE",
+        "examples": ["CODEX_OAUTH_AUTH_FILE=data/codex_oauth/auth.json"],
         "docs": [
             {
                 "label": "LLM 配置指南",
@@ -297,7 +414,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "LITELLM_MODEL": {
         "title": "Primary Model",
-        "description": "Primary model in provider/model format (e.g. gemini/gemini-3.1-pro-preview, deepseek/deepseek-v4-flash, anthropic/claude-sonnet-4-6). If empty, it is auto-inferred from available API keys or channel declarations.",
+        "description": "Primary LiteLLM model in provider/model format (e.g. gemini/gemini-3.1-pro-preview, deepseek/deepseek-v4-flash, anthropic/claude-sonnet-4-6). If empty, it is auto-inferred from available API keys or channel declarations. Used for reports only while the analysis generation method is LiteLLM; otherwise it serves the fallback backend and the ask-stock Agent path.",
         "category": "ai_model",
         "data_type": "string",
         "ui_control": "text",
@@ -3868,14 +3985,16 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             {"label": "Auto (recommended)", "value": "auto"},
             {"label": "Default model settings", "value": "litellm"},
             {"label": "Codex local Agent (experimental)", "value": "codex_app_server"},
+            {"label": "OpenAI-OAuth (ChatGPT/Codex subscription)", "value": "codex_oauth"},
         ],
-        "validation": {"enum": ["auto", "litellm", "codex_app_server"]},
+        "validation": {"enum": ["auto", "litellm", "codex_app_server", "codex_oauth"]},
         "display_order": 2,
         "help_key": "settings.agent.AGENT_BACKEND",
         "examples": [
             "AGENT_BACKEND=auto",
             "AGENT_BACKEND=litellm",
             "AGENT_BACKEND=codex_app_server",
+            "AGENT_BACKEND=codex_oauth",
         ],
         "docs": [
             {

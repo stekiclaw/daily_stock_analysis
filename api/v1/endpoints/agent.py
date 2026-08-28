@@ -125,7 +125,9 @@ async def get_agent_models():
         selected_backend = resolve_agent_backend_id(config)
     except AgentBackendConfigError:
         return AgentModelsResponse(models=[])
-    if selected_backend == "codex_app_server":
+    if selected_backend != "litellm":
+        # Only the LiteLLM route exposes switchable deployments; the other
+        # backends each run one configured model.
         return AgentModelsResponse(models=[])
     return AgentModelsResponse(
         models=[AgentModelDeployment(**item) for item in list_agent_model_deployments(config)]

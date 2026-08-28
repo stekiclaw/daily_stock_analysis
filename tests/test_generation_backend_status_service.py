@@ -542,3 +542,62 @@ def test_public_effective_config_builder_preserves_smoke_overrides() -> None:
     assert config.generation_backend == "codex_cli"
     assert config.generation_backend_timeout_seconds == 17
     assert config.litellm_model == "openai/gpt-4o-mini"
+
+
+def test_codex_oauth_without_credential_reports_login_required(tmp_path) -> None:
+    service = GenerationBackendStatusService(
+        effective_map={
+            "GENERATION_BACKEND": "codex_oauth",
+            "GENERATION_FALLBACK_BACKEND": "",
+            "CODEX_OAUTH_AUTH_FILE": str(tmp_path / "missing.json"),
+        }
+    )
+
+    primary = service.get_status()["primary"]
+
+    assert primary["backend_id"] == "codex_oauth"
+    assert primary["backend_type"] == "remote_oauth"
+    assert primary["available"] is False
+    assert primary["health_status"] == "failed"
+    # login_required, not the generic backend_not_configured: the fix is to
+    # authorize, and the "unsupported backend" branch must not swallow it.
+    assert primary["last_error_code"] == "login_required"
+    assert "unsupported_generation_backend" not in (primary["last_error_message"] or "")
+
+
+def test_codex_oauth_with_stored_credential_is_available(tmp_path) -> None:
+    import json
+    import time
+
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(
+        json.dumps(
+            {
+                "type": "codex",
+                "access_token": "header.payload.signature",
+                "refresh_token": "rt.test",
+                "account_id": "account-123",
+                "expires_at": time.time() + 3600,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    service = GenerationBackendStatusService(
+        effective_map={
+            "GENERATION_BACKEND": "codex_oauth",
+            "GENERATION_FALLBACK_BACKEND": "",
+            "CODEX_OAUTH_AUTH_FILE": str(auth_file),
+        }
+    )
+
+    primary = service.get_status()["primary"]
+
+    assert primary["available"] is True
+    assert primary["last_error_code"] is None
+    assert primary["backend_type"] == "remote_oauth"
+    # Capabilities must come from the real backend, not the LiteLLM default.
+    assert primary["supports_tools"] is False
+    assert primary["supports_stream"] is False
+    assert primary["supports_json"] is True
+    assert primary["usage_available"] is False

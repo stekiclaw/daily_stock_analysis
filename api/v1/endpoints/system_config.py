@@ -7,9 +7,16 @@ import os
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from api.deps import get_runtime_scheduler_service, get_system_config_service
+from api.deps import (
+    get_codex_oauth_login_service,
+    get_runtime_scheduler_service,
+    get_system_config_service,
+)
 from api.v1.schemas.common import ErrorResponse
 from api.v1.schemas.system_config import (
+    CodexOAuthLoginSessionResponse,
+    CodexOAuthLoginStartResponse,
+    CodexOAuthStatusResponse,
     AgentBackendStatusPreviewRequest,
     AgentBackendStatusResponse,
     DiscoverLLMChannelModelsRequest,
@@ -42,6 +49,8 @@ from src.services.system_config_service import (
     SystemConfigService,
 )
 from src.services.runtime_scheduler import RuntimeSchedulerService
+from src.services.codex_oauth_login_service import CodexOAuthLoginService
+from src.llm import codex_oauth
 
 logger = logging.getLogger(__name__)
 
@@ -724,5 +733,135 @@ def get_system_config_schema(
             detail={
                 "error": "internal_error",
                 "message": "Failed to load system configuration schema",
+            },
+        )
+
+
+@router.get(
+    "/config/codex-oauth/status",
+    response_model=CodexOAuthStatusResponse,
+    responses={
+        200: {"description": "Codex OAuth credential status returned"},
+        500: {"description": "Internal server error", "model": ErrorResponse},
+    },
+    summary="Get Codex OAuth credential status",
+    description=(
+        "Report whether a ChatGPT/Codex subscription credential is stored, and which "
+        "account it belongs to. Never returns token material."
+    ),
+)
+def get_codex_oauth_status(
+    service: CodexOAuthLoginService = Depends(get_codex_oauth_login_service),
+) -> CodexOAuthStatusResponse:
+    """Return the stored Codex OAuth credential status."""
+    try:
+        return CodexOAuthStatusResponse.model_validate(service.get_credential_status())
+    except Exception as exc:
+        logger.error("Failed to read Codex OAuth status: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": "Failed to read Codex OAuth status",
+            },
+        )
+
+
+@router.post(
+    "/config/codex-oauth/login",
+    response_model=CodexOAuthLoginStartResponse,
+    responses={
+        200: {"description": "Device login started"},
+        502: {"description": "Upstream device authorization failed", "model": ErrorResponse},
+        500: {"description": "Internal server error", "model": ErrorResponse},
+    },
+    summary="Start Codex OAuth device login",
+    description=(
+        "Request a device code from OpenAI and start polling in the background. "
+        "The caller shows the returned verification URL and user code, then polls the "
+        "session endpoint until it reports authorized."
+    ),
+)
+def start_codex_oauth_login(
+    service: CodexOAuthLoginService = Depends(get_codex_oauth_login_service),
+) -> CodexOAuthLoginStartResponse:
+    """Start a Codex OAuth device-code login session."""
+    try:
+        return CodexOAuthLoginStartResponse.model_validate(service.start_login())
+    except codex_oauth.CodexOAuthError as exc:
+        logger.warning("Failed to start Codex OAuth login: %s", exc.message)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": exc.reason,
+                "message": exc.detail or exc.reason,
+            },
+        )
+    except Exception as exc:
+        logger.error("Failed to start Codex OAuth login: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": "Failed to start Codex OAuth login",
+            },
+        )
+
+
+@router.get(
+    "/config/codex-oauth/login/{session_id}",
+    response_model=CodexOAuthLoginSessionResponse,
+    responses={
+        200: {"description": "Session state returned"},
+        500: {"description": "Internal server error", "model": ErrorResponse},
+    },
+    summary="Poll one Codex OAuth device login session",
+    description=(
+        "Return `pending` while waiting for the browser confirmation, then `authorized`, "
+        "`failed`, `cancelled`, or `unknown` for an expired or unrecognized session."
+    ),
+)
+def get_codex_oauth_login_session(
+    session_id: str,
+    service: CodexOAuthLoginService = Depends(get_codex_oauth_login_service),
+) -> CodexOAuthLoginSessionResponse:
+    """Poll one Codex OAuth device-login session."""
+    try:
+        return CodexOAuthLoginSessionResponse.model_validate(service.get_session(session_id))
+    except Exception as exc:
+        logger.error("Failed to poll Codex OAuth login session: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": "Failed to poll Codex OAuth login session",
+            },
+        )
+
+
+@router.post(
+    "/config/codex-oauth/login/{session_id}/cancel",
+    response_model=CodexOAuthLoginSessionResponse,
+    responses={
+        200: {"description": "Session cancelled"},
+        500: {"description": "Internal server error", "model": ErrorResponse},
+    },
+    summary="Cancel one Codex OAuth device login session",
+    description="Stop background polling for a login the user abandoned.",
+)
+def cancel_codex_oauth_login_session(
+    session_id: str,
+    service: CodexOAuthLoginService = Depends(get_codex_oauth_login_service),
+) -> CodexOAuthLoginSessionResponse:
+    """Cancel one Codex OAuth device-login session."""
+    try:
+        return CodexOAuthLoginSessionResponse.model_validate(service.cancel_login(session_id))
+    except Exception as exc:
+        logger.error("Failed to cancel Codex OAuth login session: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": "Failed to cancel Codex OAuth login session",
             },
         )

@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] PR CI 增加文档路径检测：仅修改普通文档、非治理 Markdown 或 LICENSE 时跳过后端测试分片、Docker、Web 与桌面打包，保留轻量治理和门禁汇总；契约文档、静态 API 规格与测试 fixture 仍执行后端回归。
 - [修复] Linux/Docker 分享图补齐 Noto CJK 字体与中韩文字体栈，避免 PNG 只显示数字和英文、中文或韩文内容消失。
 - [新功能] Web Chat 意图识别层新增分词模块：`web_intent_tokenizer` 六步管道（多股票全名实体扫描 → 标点/空白切分 → 代码形提取 → 市场关键词 → 无歧义关键词 → 残存 gap 多策略 DFS 匹配）把用户消息切分为携带语义标签的 Token 序列；配套 `web_intent_types` 数据字典（Token 结构、Market 枚举、21 个语义 tag、clean/extend 双词池与正则机器）。核心原则"宁可不做，不可做错"：Step 1~5 只做精确匹配，Step 6 要求整段 TAG 全覆盖（交叉验证）才产出，未覆盖片段保持空 tag 交下游 LLM 兜底；代码形 token 辨认为 `stock_code`（附 code/name/market 三元组）/ `wrong_{market}_code` / `unknown_{market}_code` 三态，token 层代码拼写统一 canonical 归一（a=6 位裸数字、hk=HK+5 位、us=大写 ticker）。意图枚举与意图识别结果随后续 `web_intent_resolver` PR 引入。新增 183 个分词单元测试。
+- [新功能] Web 设置页支持 OpenAI-OAuth：「AI 模型接入」新增授权卡片，可在页面上完成设备码授权（显示验证链接与设备码、自动轮询、展示已授权账号与凭证有效期），「快速添加渠道」的服务商下拉新增 OpenAI-OAuth 入口；新增 `CODEX_OAUTH_MODEL` / `CODEX_OAUTH_REASONING_EFFORT` / `CODEX_OAUTH_AUTH_FILE` 配置项。配套新增 `/api/v1/system/config/codex-oauth/status|login` 接口，浏览器全程不接触 token。
+- [新功能] 新增 `codex_oauth` 生成后端：用 ChatGPT/Codex 订阅的 OAuth 设备码授权直连 ChatGPT Responses 接口，不需要本机 CLI，也不消耗按量计费的 `OPENAI_API_KEY`；支持显式选择 gpt-5.6 系列模型与推理档位，并上报真实 token 用量。配置 `GENERATION_BACKEND=codex_oauth` 启用，授权入口为 `python scripts/codex_oauth_login.py`。作为生成后端时覆盖普通分析与大盘复盘。
+- [改进] `stock_list_us_etf.csv` 补充 `RAM`（Roundhill T-REX 2x Long DRAM Daily Target ETF）与 `DRAM`（Roundhill Memory ETF），种子数据源扩充至 94 只；`RAM` 同步接入 `get_leveraged_etf_metadata`（2x 做多，跟踪标的为 DRAM ETF 自身日内价格表现，而非传统指数）。
+- [改进] `stock_list_us_etf.csv` 种子数据源扩充至 92 只，新增约 30 只杠杆/反向 ETF（ProShares/Direxion 2x/3x 做多做空，覆盖大盘指数、行业板块、国债、金矿、中国、天然气等），自动补全下拉相应覆盖。
+- [新功能] `DataFetcherManager` 新增 `get_leveraged_etf_metadata`，静态查表返回杠杆/反向 ETF 的发行方/跟踪标的/杠杆倍数/方向/每日重置风险提示，标的不在已知清单内（含普通非杠杆 ETF）时返回 `not_supported`。
+- [新功能] `DataFetcherManager` 新增 `get_stock_extended_profile`，基于 yfinance 提供个股扩展基本面（PEG/EV-EBITDA/市销率/远期市盈率等估值倍数、资产负债表快照、分析师目标价一致预期、52周区间、空头持仓、下次财报日与营收/EPS 一致预期），与现有 `get_fundamental_bundle` 互补而不重复。
+- [改进] 股票搜索框自动补全下拉支持美股 ETF：`scripts/generate_index_from_csv.py` 新增 `stock_list_us_etf.csv` 种子数据源（`scripts/stock_index_seeds/`），生成的索引条目 `market="ETF"`、`assetType="etf"`；`stocks.index.json` 已同步补充；`SUPPORTED_STOCK_INDEX_MARKETS` 新增 `ETF`。前端 `StockAutocomplete`/`SuggestionsList` 组件原本已支持 ETF 徽标与类型，此前因索引数据源缺失 ETF 数据而没有下拉提示。
+- [新功能] `DataFetcherManager` 新增 `get_option_expirations` / `get_option_chain`，基于 yfinance 提供美股/ETF 期权到期日与期权链（Calls/Puts，含 strike/bid/ask/last/volume/openInterest/impliedVolatility），fail-open，标的不支持期权时返回 None。
+- [新功能] `DataFetcherManager` 新增 `get_etf_profile`，基于 yfinance `info`/`funds_data` 提供 ETF 专属信息（category/fund_family/expense_ratio_pct/nav/aum/distribution_yield_pct/ytd_return_pct/top_holdings/sector_weights），通过 `info.quoteType == "ETF"` 判定，与现有基本面聚合流程（`get_fundamental_context`）相互独立、互不影响。
+- [新功能] 新增 `--portfolio futu`，只读导入 Futu OpenD 真实账户的沪深 A 股、港股、美股 LONG 正股持仓作为分析列表。
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [新功能] 完善 Futu OpenD 港股数据源接入：系统设置支持 OpenD 地址、端口和港股实时数据源优先级，保留 Longbridge、AkShare、YFinance fallback。
@@ -213,6 +223,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] `.env.example` 与 `.github/workflows/00-daily-analysis.yml` 同步映射 `TUSHARE_HTTP_URL`，避免出现"配置项有但 workflow 漏映射"的半修状态
 - [修复] #2051 PR Review 的特权 `pull_request_target` 流程不再检出 fork PR head：敏感文件、标签、报告与 AI 审查统一通过 GitHub API 将 PR 元数据和 diff 作为数据读取，只执行主分支可信脚本；Python 语法、Flake8、确定性检查和离线测试继续由无 secrets 的 `pull_request` CI / `backend-gate` 执行，兼容 `actions/checkout` 新增的 fork checkout 安全保护。
 - [修复] 修复 Windows 上 mimetypes 冷启动时读取注册表导致的进程卡死
+- [修复] 大盘复盘的运行诊断把 LLM 调用固定记成 `provider=litellm` 与 `LITELLM_MODEL`，在非 LiteLLM 生成后端（本地 CLI / OpenAI-OAuth）或触发 fallback 时标注错误。`generate_text()` / `_call_litellm()` 新增可选 `call_metadata`，回传**实际服务该次调用的后端与模型**，诊断改用真实值；调用发生前与失败时回退到当前配置的后端标识。
+- [修复] `codex_oauth` 生成后端此前被若干仅判断本地 CLI 后端的分支漏掉，导致：配置预检不校验 OAuth 凭证、未配置任何 LiteLLM 渠道时 `has_configured_llm_runtime()` 误判为不可用而拦截大盘复盘、启动日志误报未配置 LLM、`[LLM配置]` 日志标注成 LiteLLM 模型名。改为统一按「非 LiteLLM 生成后端」判断。
+- [改进] 设置页保存后新增提示：当某项配置同时由启动期进程环境变量注入（Docker `env_file` / `environment`、shell export）时，本次保存虽对当前进程立即生效，但进程重启会被环境变量重新覆盖而悄悄回滚；提示会列出受影响的配置项并说明需同步修改注入来源。
+- [新功能] 问股 Chat 支持 `AGENT_BACKEND=codex_oauth`：用同一份 ChatGPT/Codex OAuth 凭证直接跑工具调用，不再需要 LiteLLM 渠道或按量计费的 `OPENAI_API_KEY`。DSA 仍拥有 Agent 循环（工具执行、并行调用、超时、进度与取消行为不变），新增的适配层只负责消息与工具声明在 OpenAI chat 格式与 Responses `function_call` / `function_call_output` 之间的转换。新增 `AGENT_CODEX_OAUTH_MODEL`，留空继承 `CODEX_OAUTH_MODEL`，可让问股与报告生成使用不同型号。
 
 ## [3.27.0] - 2026-07-19
 

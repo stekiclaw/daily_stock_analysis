@@ -11,4 +11,5 @@ export * from './SettingsSectionCard';
 export * from './SettingsCategoryNav';
 export * from './AuthSettingsCard';
 export * from './GenerationBackendStatusPanel';
+export * from './CodexOAuthPanel';
 export * from './AgentBackendStatusPanel';

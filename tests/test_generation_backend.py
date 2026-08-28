@@ -258,6 +258,7 @@ def test_unknown_generation_backend_raises_structured_config_error() -> None:
     assert error.details["supported_backends"] == [
         "claude_code_cli",
         "codex_cli",
+        "codex_oauth",
         "litellm",
         "opencode_cli",
     ]
@@ -314,6 +315,7 @@ def test_unknown_agent_backend_raises_structured_config_error() -> None:
         "auto",
         "claude_code_cli",
         "codex_cli",
+        "codex_oauth",
         "litellm",
         "opencode_cli",
     ]

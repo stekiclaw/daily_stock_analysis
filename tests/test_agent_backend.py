@@ -549,3 +549,41 @@ def test_app_server_usage_uses_documented_last_turn_counts_only() -> None:
         "completion_tokens_details": {"reasoning_tokens": 12},
     }
     assert normalize_token_usage_notification({"tokenUsage": {"last": {}}}) is None
+
+
+# --- codex_oauth agent backend ----------------------------------------------
+
+
+def test_codex_oauth_backend_reuses_the_dsa_owned_loop() -> None:
+    """It must behave like LiteLLM, not like the runtime-owns-loop Codex backend."""
+    from src.agent.agent_backend import CodexOAuthAgentBackend
+
+    assert CodexOAuthAgentBackend.runtime_owns_loop is False
+    assert CodexOAuthAgentBackend.backend_id == "codex_oauth"
+    # Same run() implementation as LiteLLM: only the adapter differs.
+    assert CodexOAuthAgentBackend.run is LiteLLMAgentBackend.run
+
+
+def test_codex_oauth_is_a_selectable_agent_backend() -> None:
+    assert resolve_agent_backend_id(SimpleNamespace(agent_backend="codex_oauth")) == "codex_oauth"
+
+
+def test_codex_oauth_chat_factory_builds_the_oauth_adapter() -> None:
+    from src.agent.codex_oauth_adapter import CodexOAuthToolAdapter
+    from src.agent.factory import build_agent_chat_executor
+
+    config = SimpleNamespace(
+        agent_backend="codex_oauth",
+        agent_arch="single",
+        agent_mode=True,
+        codex_oauth_auth_file="data/codex_oauth/auth.json",
+        codex_oauth_model="gpt-5.6-sol",
+        codex_oauth_reasoning_effort="medium",
+        agent_codex_oauth_model="gpt-5.6-terra",
+    )
+    executor = build_agent_chat_executor(config)
+
+    assert executor.backend.backend_id == "codex_oauth"
+    # The same adapter serves the conversation-summary path, which LiteLLM also
+    # uses its adapter for; only the runtime-owns-loop backend passes None.
+    assert isinstance(executor.context_llm_adapter, CodexOAuthToolAdapter)

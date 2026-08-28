@@ -48,6 +48,14 @@ export const LLM_PROVIDER_CAPABILITY_LABELS: Record<LLMProviderCapability, { lab
   },
 };
 
+/**
+ * OpenAI-OAuth 不是 LiteLLM 渠道：它是 generation backend，没有 Base URL / API Key。
+ * 这里只作为服务商下拉里的一个入口存在，选中后引导到上方的授权卡片，
+ * 不会生成任何 LLM_<名字>_* 配置。
+ */
+export const CODEX_OAUTH_PICKER_OPTION_ID = '__openai_oauth__';
+export const CODEX_OAUTH_PANEL_DOM_ID = 'codex-oauth-panel';
+
 export const LLM_PROVIDER_TEMPLATES: LLMProviderTemplate[] = [
   {
     channelId: 'aihubmix',

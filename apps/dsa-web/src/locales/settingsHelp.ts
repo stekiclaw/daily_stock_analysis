@@ -39,6 +39,7 @@ const settingsHelpZhCN: SettingsHelpMap = {
     usage: '通常保持“默认模型配置”。只有在本机已安装并登录对应 CLI，且你信任它处理分析内容时，才选择本地 CLI 生成方式（实验）。',
     valueNotes: [
       '本地 CLI 生成方式是本机启动的命令行程序，不等于离线模型；背后的服务可能处理股票代码、新闻、持仓上下文、分析请求和报告草稿。',
+      'OpenAI-OAuth 用 ChatGPT/Codex 订阅授权直连，不需要本机安装 CLI，也不消耗按量计费的 OPENAI_API_KEY；需要先在上方授权卡片完成设备码登录。',
       'Docker、云服务器、CI 不天然拥有你本机的登录状态；DSA 不读取 Codex/Claude/OpenCode 登录凭据文件，但对应 CLI 自己可能使用它的登录状态。',
     ],
     impact: ['影响普通分析、大盘复盘和文本生成入口，不改变问股助手的工具执行规则。'],
@@ -48,6 +49,39 @@ const settingsHelpZhCN: SettingsHelpMap = {
       '默认模型配置会继续使用现有 API Key、模型渠道和备用模型设置。',
     ],
     examples: [],
+  },
+  'settings.ai_model.CODEX_OAUTH_MODEL': {
+    title: 'OpenAI-OAuth 模型',
+    showFieldKey: false,
+    summary: '「分析生成方式」选择 OpenAI-OAuth 时实际调用的模型。',
+    usage: '留空使用默认模型 gpt-5.6-terra。可用型号取决于你的 ChatGPT/Codex 订阅权限。',
+    valueNotes: ['模型清单由 OpenAI 侧决定，可能随订阅等级和官方调整变化；填了不可用的型号会在真实分析时返回明确错误。'],
+    impact: ['只影响 OpenAI-OAuth 生成方式，不改变默认模型配置下的模型选择。'],
+    notes: [],
+    examples: ['gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-5.6-luna'],
+  },
+  'settings.ai_model.CODEX_OAUTH_REASONING_EFFORT': {
+    title: 'OpenAI-OAuth 推理档位',
+    showFieldKey: false,
+    summary: '控制 OpenAI-OAuth 生成时投入的推理量。',
+    usage: '默认 medium。档位越高通常质量越好但更慢、消耗更多额度；选择 none 则不附带推理参数。',
+    valueNotes: [],
+    impact: ['只影响 OpenAI-OAuth 生成方式。'],
+    notes: [],
+    examples: ['medium'],
+  },
+  'settings.ai_model.CODEX_OAUTH_AUTH_FILE': {
+    title: 'OpenAI-OAuth 凭证路径',
+    showFieldKey: false,
+    summary: '设备码授权后，OAuth 凭证保存在哪里。',
+    usage: '默认 data/codex_oauth/auth.json。Docker 部署中 data/ 是挂载卷，放在这里可以让授权在重建容器后依然有效。',
+    valueNotes: [
+      '凭证文件权限为 0600，等同于账号访问权，不要放到会被导出或备份到外部的目录。',
+      '不要和其他工具共用同一份凭证文件：刷新令牌可能轮换，两个程序同时写会互相踢掉登录状态。',
+    ],
+    impact: ['改路径后需要重新完成一次授权，除非新路径下已有可用凭证。'],
+    notes: [],
+    examples: ['data/codex_oauth/auth.json'],
   },
   'settings.ai_model.GENERATION_FALLBACK_BACKEND': {
     title: '备用生成方式',
@@ -110,7 +144,9 @@ const settingsHelpZhCN: SettingsHelpMap = {
       'Agent 可通过 AGENT_LITELLM_MODEL 单独指定模型；留空时继承主模型。',
     ],
     impact: [
-      '影响普通个股分析、大盘复盘、报告生成，以及未单独覆盖模型的 Agent 调用。',
+      '仅在「分析生成方式」为 LiteLLM 时，影响普通个股分析、大盘复盘与报告生成；'
+        + '选用本地 CLI 或 OpenAI-OAuth 等其他生成后端时，报告由该后端的模型生成，本项只作为备用后端的模型。',
+      '无论生成后端是哪个，问股的 Agent 工具调用始终走 LiteLLM，未单独设置 AGENT_LITELLM_MODEL 时使用本项。',
     ],
     notes: [
       '无 provider 前缀时，LiteLLM 可能无法判断应该使用哪组 API Key。',
@@ -847,6 +883,21 @@ const settingsHelpZhCN: SettingsHelpMap = {
     impact: ['影响个股分析流程、报告生成质量和 LLM 调用次数。'],
     notes: ['Agent 模式会消耗更多 token 和时间，适合需要深度推理的场景。'],
   },
+  'settings.agent.AGENT_CODEX_OAUTH_MODEL': {
+    title: '问股 OpenAI-OAuth 模型',
+    showFieldKey: false,
+    summary: '问股生成方式选择 OpenAI-OAuth 时，Agent 使用的模型。',
+    usage: '留空则沿用「AI 模型设置」里的 OpenAI-OAuth 模型；填写后问股可以用与报告生成不同的模型。',
+    valueNotes: [
+      '常见取值：gpt-5.6-terra、gpt-5.6-sol、gpt-5.6-luna。',
+      '仅在问股生成方式为 OpenAI-OAuth 时生效，其他生成方式下本项被忽略。',
+      '推理档位与报告生成共用 CODEX_OAUTH_REASONING_EFFORT，不单独设置。',
+    ],
+    impact: ['只影响问股 Chat 的模型选择，不改变报告生成与大盘复盘使用的模型。'],
+    notes: [
+      '与报告生成共用同一份 OAuth 凭证，因此消耗的是同一个 ChatGPT/Codex 订阅额度。',
+    ],
+  },
   'settings.agent.AGENT_BACKEND': {
     title: '问股生成方式',
     showFieldKey: false,
@@ -1362,7 +1413,11 @@ const settingsHelpEnUS: SettingsHelpMap = {
       'When empty, the system tries to infer a model from available API keys or channels.',
       'Agent can use AGENT_LITELLM_MODEL; when empty, it inherits the primary model.',
     ],
-    impact: ['Affects regular stock analysis, market review, report generation, and Agent calls without a dedicated model.'],
+    impact: [
+      'Affects regular stock analysis, market review, and report generation only while the analysis generation method is LiteLLM; '
+        + 'with another generation backend (local CLI, OpenAI-OAuth) reports come from that backend\'s model and this becomes the fallback model.',
+      'Ask-stock Agent tool calls always run on LiteLLM regardless of the generation backend, and use this model unless AGENT_LITELLM_MODEL is set.',
+    ],
     notes: [
       'Without a provider prefix, LiteLLM may not know which API key to use.',
       'For Ollama, use OLLAMA_API_BASE or an Ollama channel instead of OPENAI_BASE_URL.',
@@ -2058,6 +2113,21 @@ const settingsHelpEnUS: SettingsHelpMap = {
     ],
     impact: ['Affects stock analysis flow, report quality, and LLM call count.'],
     notes: ['Agent mode consumes more tokens and time; best for scenarios requiring deep reasoning.'],
+  },
+  'settings.agent.AGENT_CODEX_OAUTH_MODEL': {
+    title: 'Ask-Stock OpenAI-OAuth Model',
+    showFieldKey: false,
+    summary: 'Model the ask-stock Agent uses when its backend is OpenAI-OAuth.',
+    usage: 'Leave empty to inherit the OpenAI-OAuth model from AI model settings, or set it to run ask-stock on a different model than report generation.',
+    valueNotes: [
+      'Common values: gpt-5.6-terra, gpt-5.6-sol, gpt-5.6-luna.',
+      'Only applies while the ask-stock backend is OpenAI-OAuth; otherwise it is ignored.',
+      'Reasoning effort is shared with report generation via CODEX_OAUTH_REASONING_EFFORT.',
+    ],
+    impact: ['Affects only the ask-stock Chat model, not report generation or market reviews.'],
+    notes: [
+      'It shares the same OAuth credential as report generation, so it draws on the same ChatGPT/Codex subscription.',
+    ],
   },
   'settings.agent.AGENT_BACKEND': {
     title: 'Ask-Stock Method',

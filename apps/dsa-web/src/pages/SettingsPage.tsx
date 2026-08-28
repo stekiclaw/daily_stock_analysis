@@ -15,6 +15,7 @@ import {
   ChangePasswordCard,
   GenerationBackendStatusPanel,
   IntelligentImport,
+  CodexOAuthPanel,
   LLMChannelEditor,
   NotificationTestPanel,
   SettingsCategoryNav,
@@ -53,6 +54,9 @@ const GENERATION_BACKEND_STATUS_KEYS = new Set([
   'GENERATION_BACKEND_MAX_CONCURRENCY',
   'LOCAL_CLI_BACKEND_MAX_CONCURRENCY',
   'OPENCODE_CLI_MODEL',
+  'CODEX_OAUTH_MODEL',
+  'CODEX_OAUTH_REASONING_EFFORT',
+  'CODEX_OAUTH_AUTH_FILE',
   'LITELLM_CONFIG',
   'LITELLM_MODEL',
   'LITELLM_FALLBACK_MODELS',
@@ -1539,6 +1543,7 @@ const SettingsPage: React.FC = () => {
                   maskToken={maskToken}
                   disabled={isSaving || isLoading}
                 />
+                <CodexOAuthPanel disabled={isSaving || isLoading} />
                 <LLMChannelEditor
                   items={rawActiveItems}
                   configVersion={configVersion}

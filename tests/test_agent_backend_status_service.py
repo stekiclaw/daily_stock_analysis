@@ -288,3 +288,49 @@ def test_completed_codex_probe_reclaims_a_lingering_child(tmp_path: Path) -> Non
         time.sleep(0.02)
     else:
         pytest.fail("completed Codex probe left its native child running")
+
+
+def test_codex_oauth_without_credential_reports_login_required(tmp_path) -> None:
+    service = AgentBackendStatusService(
+        effective_map={
+            "AGENT_BACKEND": "codex_oauth",
+            "CODEX_OAUTH_AUTH_FILE": str(tmp_path / "missing.json"),
+        }
+    )
+
+    status = service.get_status()
+
+    assert status["backend"] == "codex_oauth"
+    assert status["available"] is False
+    assert status["error_code"] == "login_required"
+    # Readiness is a stored credential, not an executable on PATH.
+    assert status["experimental"] is False
+
+
+def test_codex_oauth_with_credential_is_available(tmp_path) -> None:
+    import json as _json
+    import time as _time
+
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text(
+        _json.dumps(
+            {
+                "type": "codex",
+                "access_token": "header.payload.signature",
+                "refresh_token": "rt",
+                "account_id": "acct",
+                "expires_at": _time.time() + 3600,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = AgentBackendStatusService(
+        effective_map={
+            "AGENT_BACKEND": "codex_oauth",
+            "CODEX_OAUTH_AUTH_FILE": str(auth_file),
+        }
+    ).get_status()
+
+    assert status["available"] is True
+    assert status["error_code"] is None

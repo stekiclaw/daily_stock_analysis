@@ -43,6 +43,7 @@ from src.llm.backend_registry import (
     GENERATION_ONLY_BACKEND_IDS,
     LOCAL_CLI_GENERATION_BACKEND_IDS,
     LITELLM_BACKEND_ID,
+    NON_LITELLM_GENERATION_BACKEND_IDS,
     OPENCODE_CLI_BACKEND_ID,
     SUPPORTED_AGENT_GENERATION_BACKENDS,
     SUPPORTED_AGENT_UI_BACKENDS,
@@ -57,6 +58,11 @@ from src.llm.local_cli_backend import (
     MAX_LOCAL_CLI_BACKEND_MAX_CONCURRENCY,
     MAX_LOCAL_CLI_OUTPUT_BYTES,
     MAX_LOCAL_CLI_TIMEOUT_SECONDS,
+)
+from src.llm.codex_oauth import (
+    DEFAULT_AUTH_FILE as DEFAULT_CODEX_OAUTH_AUTH_FILE,
+    DEFAULT_EFFORT as CODEX_OAUTH_DEFAULT_EFFORT,
+    DEFAULT_MODEL as CODEX_OAUTH_DEFAULT_MODEL,
 )
 from src.llm import generation_params as llm_generation_params
 from src.llm.hermes import (
@@ -906,6 +912,13 @@ class Config:
     generation_backend_max_concurrency: int = DEFAULT_GENERATION_BACKEND_MAX_CONCURRENCY
     local_cli_backend_max_concurrency: int = DEFAULT_LOCAL_CLI_BACKEND_MAX_CONCURRENCY
     opencode_cli_model: str = ""
+    # Codex OAuth backend: credential path plus model/effort defaults.
+    codex_oauth_auth_file: str = DEFAULT_CODEX_OAUTH_AUTH_FILE
+    codex_oauth_model: str = CODEX_OAUTH_DEFAULT_MODEL
+    codex_oauth_reasoning_effort: str = CODEX_OAUTH_DEFAULT_EFFORT
+    # Ask-stock may run a different model than report generation; empty means
+    # inherit codex_oauth_model.
+    agent_codex_oauth_model: str = ""
     # LiteLLM unified model config (provider/model format, e.g. gemini/gemini-3.1-pro-preview)
     litellm_model: str = ""  # Primary model; must include provider prefix when set explicitly
     litellm_fallback_models: List[str] = field(default_factory=list)  # Cross-model fallback list
@@ -1321,6 +1334,11 @@ class Config:
     _BOOTSTRAP_RUNTIME_ENV_OVERRIDES_CAPTURED = False
     _BOOTSTRAP_RUNTIME_ENV_OVERRIDES = frozenset()
     _BOOTSTRAP_RUNTIME_ENV_PRESENT_KEYS = frozenset()
+    # Process environment as it looked before dotenv touched it. Kept private
+    # and only ever compared against, never returned, so callers cannot read
+    # credentials back out of it.
+    _BOOTSTRAP_PROCESS_ENV_SNAPSHOT = {}
+    _BOOTSTRAP_PROCESS_ENV_CAPTURED = False
 
     def __post_init__(self) -> None:
         _log = logging.getLogger(__name__)
@@ -1630,6 +1648,18 @@ class Config:
             os.getenv('AGENT_GENERATION_BACKEND', AUTO_AGENT_BACKEND_ID).strip().lower()
             or AUTO_AGENT_BACKEND_ID
         )
+        codex_oauth_auth_file = (
+            os.getenv('CODEX_OAUTH_AUTH_FILE', '').strip()
+            or DEFAULT_CODEX_OAUTH_AUTH_FILE
+        )
+        codex_oauth_model = (
+            os.getenv('CODEX_OAUTH_MODEL', '').strip() or CODEX_OAUTH_DEFAULT_MODEL
+        )
+        codex_oauth_reasoning_effort = (
+            os.getenv('CODEX_OAUTH_REASONING_EFFORT', '').strip().lower()
+            or CODEX_OAUTH_DEFAULT_EFFORT
+        )
+        agent_codex_oauth_model = os.getenv('AGENT_CODEX_OAUTH_MODEL', '').strip()
         generation_backend_timeout_seconds = parse_env_int(
             os.getenv('GENERATION_BACKEND_TIMEOUT_SECONDS'),
             DEFAULT_LOCAL_CLI_TIMEOUT_SECONDS,
@@ -1817,6 +1847,10 @@ class Config:
             generation_backend_max_concurrency=generation_backend_max_concurrency,
             local_cli_backend_max_concurrency=local_cli_backend_max_concurrency,
             opencode_cli_model=opencode_cli_model,
+            codex_oauth_auth_file=codex_oauth_auth_file,
+            codex_oauth_model=codex_oauth_model,
+            codex_oauth_reasoning_effort=codex_oauth_reasoning_effort,
+            agent_codex_oauth_model=agent_codex_oauth_model,
             litellm_model=litellm_model,
             litellm_fallback_models=litellm_fallback_models,
             llm_temperature=resolve_unified_llm_temperature(litellm_model),
@@ -2815,6 +2849,14 @@ class Config:
         do **not** flag the key, so that a later ``.env`` update by WebUI can
         take effect on config reload without requiring a container restart.
         """
+        if not cls._BOOTSTRAP_PROCESS_ENV_CAPTURED:
+            # Captured once per process and deliberately never refreshed: a
+            # WebUI save reloads with override=True, so on any later call
+            # os.environ already carries persisted-file values and they would
+            # be misread as process-injected ones.
+            cls._BOOTSTRAP_PROCESS_ENV_SNAPSHOT = dict(os.environ)
+            cls._BOOTSTRAP_PROCESS_ENV_CAPTURED = True
+
         if cls._BOOTSTRAP_RUNTIME_ENV_OVERRIDES_CAPTURED:
             return
 
@@ -2833,6 +2875,22 @@ class Config:
         cls._BOOTSTRAP_RUNTIME_ENV_OVERRIDES = frozenset(explicit_overrides)
         cls._BOOTSTRAP_RUNTIME_ENV_PRESENT_KEYS = frozenset(present_keys)
         cls._BOOTSTRAP_RUNTIME_ENV_OVERRIDES_CAPTURED = True
+
+    @classmethod
+    def bootstrap_process_env_shadows(cls, key: str, saved_value: str) -> bool:
+        """Whether a startup process env var will override ``saved_value`` on restart.
+
+        Docker ``env_file`` / ``environment:`` inject values into the process
+        environment. A WebUI save writes the persisted env file and reloads with
+        ``override=True``, so it applies to the running process - but the next
+        start re-injects the old process value, and the non-override dotenv load
+        cannot beat it. Settings uses this to warn instead of silently reverting.
+        """
+        cls._capture_bootstrap_runtime_env_overrides()
+        bootstrap_value = cls._BOOTSTRAP_PROCESS_ENV_SNAPSHOT.get(key)
+        if bootstrap_value is None:
+            return False
+        return bootstrap_value != (saved_value or "")
 
     @classmethod
     def _has_bootstrap_runtime_env_override(cls, key: str) -> bool:
@@ -3235,7 +3293,7 @@ class Config:
         # Other LiteLLM-native providers (for example cohere/*) run through the
         # direct litellm env path and therefore do not populate llm_model_list.
         has_direct_env_model = bool(self.litellm_model) and _uses_direct_env_provider(self.litellm_model)
-        local_generation_backend = generation_backend in LOCAL_CLI_GENERATION_BACKEND_IDS
+        local_generation_backend = generation_backend in NON_LITELLM_GENERATION_BACKEND_IDS
         if not local_generation_backend and not self.llm_model_list and not has_direct_env_model:
             if self.litellm_config_path:
                 issues.append(ConfigIssue(

@@ -108,7 +108,7 @@ export type GenerationBackendSmokeMode = 'text' | 'json';
 
 export interface GenerationBackendStatus {
   backendId: string;
-  backendType: 'litellm' | 'local_cli';
+  backendType: 'litellm' | 'local_cli' | 'remote_oauth';
   providerId: string;
   available: boolean;
   healthStatus: GenerationBackendHealthStatus;
@@ -164,7 +164,7 @@ export interface TestGenerationBackendResponse {
 }
 
 export interface AgentBackendStatusResponse {
-  backend: 'litellm' | 'codex_app_server' | string;
+  backend: 'litellm' | 'codex_app_server' | 'codex_oauth' | string;
   available: boolean;
   experimental: boolean;
   version?: string | null;
@@ -358,4 +358,40 @@ export interface SystemConfigConflictResponse {
   error: string;
   message: string;
   currentConfigVersion: string;
+}
+
+export interface CodexOAuthStatus {
+  authorized: boolean;
+  authFile: string;
+  email?: string | null;
+  planType?: string | null;
+  expiresAt?: number | null;
+  expiresInSeconds?: number | null;
+  refreshable?: boolean | null;
+  reason?: string | null;
+  message?: string | null;
+}
+
+export interface CodexOAuthLoginStart {
+  sessionId: string;
+  userCode: string;
+  verificationUrl: string;
+  intervalSeconds: number;
+  expiresAt: number;
+  state: string;
+}
+
+export type CodexOAuthLoginState = 'pending' | 'authorized' | 'failed' | 'cancelled' | 'unknown';
+
+export interface CodexOAuthLoginSession {
+  sessionId: string;
+  state: CodexOAuthLoginState;
+  userCode?: string | null;
+  verificationUrl?: string | null;
+  expiresAt?: number | null;
+  email?: string | null;
+  planType?: string | null;
+  lastRefresh?: string | null;
+  reason?: string | null;
+  message?: string | null;
 }

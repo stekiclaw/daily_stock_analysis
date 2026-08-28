@@ -4,6 +4,9 @@ import { toCamelCase } from './utils';
 import type {
   AgentBackendStatusPreviewRequest,
   AgentBackendStatusResponse,
+  CodexOAuthLoginSession,
+  CodexOAuthLoginStart,
+  CodexOAuthStatus,
   DiscoverLLMChannelModelsRequest,
   DiscoverLLMChannelModelsResponse,
   ExportSystemConfigResponse,
@@ -209,6 +212,34 @@ export const systemConfigApi = {
       '/api/v1/system/config/generation-backends/status',
     );
     return toCamelCase<GenerationBackendStatusResponse>(response.data);
+  },
+
+  async getCodexOAuthStatus(): Promise<CodexOAuthStatus> {
+    const response = await apiClient.get<Record<string, unknown>>(
+      '/api/v1/system/config/codex-oauth/status',
+    );
+    return toCamelCase<CodexOAuthStatus>(response.data);
+  },
+
+  async startCodexOAuthLogin(): Promise<CodexOAuthLoginStart> {
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/system/config/codex-oauth/login',
+    );
+    return toCamelCase<CodexOAuthLoginStart>(response.data);
+  },
+
+  async getCodexOAuthLoginSession(sessionId: string): Promise<CodexOAuthLoginSession> {
+    const response = await apiClient.get<Record<string, unknown>>(
+      `/api/v1/system/config/codex-oauth/login/${encodeURIComponent(sessionId)}`,
+    );
+    return toCamelCase<CodexOAuthLoginSession>(response.data);
+  },
+
+  async cancelCodexOAuthLogin(sessionId: string): Promise<CodexOAuthLoginSession> {
+    const response = await apiClient.post<Record<string, unknown>>(
+      `/api/v1/system/config/codex-oauth/login/${encodeURIComponent(sessionId)}/cancel`,
+    );
+    return toCamelCase<CodexOAuthLoginSession>(response.data);
   },
 
   async previewGenerationBackendStatus(

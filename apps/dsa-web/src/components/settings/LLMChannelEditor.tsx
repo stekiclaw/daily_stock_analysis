@@ -8,6 +8,8 @@ import { ApiErrorAlert, Badge, Button, InlineAlert, Input, Select, StatusDot, To
 import type { ChannelProtocol } from './llmProviderTemplates';
 import {
   LLM_PROVIDER_CAPABILITY_LABELS,
+  CODEX_OAUTH_PANEL_DOM_ID,
+  CODEX_OAUTH_PICKER_OPTION_ID,
   LLM_PROVIDER_TEMPLATES,
   MODEL_PLACEHOLDERS_BY_PROTOCOL,
   getProviderTemplate,
@@ -1900,6 +1902,14 @@ export const LLMChannelEditor: React.FC<LLMChannelEditorProps> = ({
   };
 
   const addChannel = () => {
+    // OpenAI-OAuth 是 generation backend，不是渠道：不建草稿，只把用户送到授权卡片。
+    if (addPreset === CODEX_OAUTH_PICKER_OPTION_ID) {
+      document.getElementById(CODEX_OAUTH_PANEL_DOM_ID)?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+      });
+      return;
+    }
     const preset = getProviderTemplate(addPreset) || getProviderTemplate('custom');
     if (!preset) {
       return;
@@ -2325,20 +2335,32 @@ export const LLMChannelEditor: React.FC<LLMChannelEditorProps> = ({
             </div>
             <div className="flex items-center gap-2">
               <Button type="button" variant="settings-primary" className="whitespace-nowrap" disabled={busy} onClick={addChannel}>
-                + 添加渠道
+                {addPreset === CODEX_OAUTH_PICKER_OPTION_ID ? '前往授权' : '+ 添加渠道'}
               </Button>
               <Select
                 value={addPreset}
                 onChange={setAddPreset}
-                options={LLM_PROVIDER_TEMPLATES.map((preset) => ({
-                  value: preset.channelId,
-                  label: preset.label,
-                }))}
+                options={[
+                  ...LLM_PROVIDER_TEMPLATES.map((preset) => ({
+                    value: preset.channelId,
+                    label: preset.label,
+                  })),
+                  {
+                    value: CODEX_OAUTH_PICKER_OPTION_ID,
+                    label: 'OpenAI-OAuth（ChatGPT/Codex 订阅）',
+                  },
+                ]}
                 disabled={busy}
                 placeholder="选择服务商"
                 className="flex-1"
               />
             </div>
+            {addPreset === CODEX_OAUTH_PICKER_OPTION_ID ? (
+              <p className="mt-2 text-xs text-muted-text">
+                OpenAI-OAuth 用订阅授权，不需要 Base URL 和 API Key。点「前往授权」到上方的授权卡片完成设备码登录，
+                再把「分析生成方式」设为 OpenAI-OAuth。
+              </p>
+            ) : null}
           </div>
 
           <div className="space-y-2">

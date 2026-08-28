@@ -438,6 +438,7 @@ const fieldOptionLabelMap: Record<string, Record<string, string>> = {
     auto: '自动（推荐）',
     litellm: '默认模型配置',
     codex_app_server: 'Codex 本地 Agent（实验）',
+    codex_oauth: 'OpenAI-OAuth（ChatGPT/Codex 订阅）',
   },
   LOG_LEVEL: {
     debug: '调试',
@@ -522,6 +523,7 @@ const fieldOptionLabelMapEn: Record<string, Record<string, string>> = {
     auto: 'Auto (recommended)',
     litellm: 'Default model settings',
     codex_app_server: 'Codex local Agent (experimental)',
+    codex_oauth: 'OpenAI-OAuth (ChatGPT/Codex subscription)',
   },
   LOG_LEVEL: {
     debug: 'Debug',

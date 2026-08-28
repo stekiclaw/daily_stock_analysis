@@ -228,7 +228,26 @@ class AgentBackendStatusService:
             )
         if evaluation["backend"] == "litellm":
             return self._response(backend="litellm", available=True)
+        if evaluation["backend"] == "codex_oauth":
+            return self._codex_oauth_cheap_status()
         return self._codex_cheap_status()
+
+    def _codex_oauth_cheap_status(self) -> Dict[str, Any]:
+        """There is no executable to probe: readiness is a stored credential."""
+        from src.llm import codex_oauth
+
+        config = self._build_config()
+        auth_file = str(getattr(config, "codex_oauth_auth_file", "") or "")
+        try:
+            codex_oauth.load_credential(auth_file)
+        except codex_oauth.CodexOAuthError as exc:
+            return self._response(
+                backend="codex_oauth",
+                available=False,
+                error_code="login_required",
+                message=exc.detail or exc.reason,
+            )
+        return self._response(backend="codex_oauth", available=True)
 
     def _codex_cheap_status(self) -> Dict[str, Any]:
         if is_native_windows():
