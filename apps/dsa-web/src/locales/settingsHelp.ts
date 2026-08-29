@@ -746,6 +746,17 @@ const settingsHelpZhCN: SettingsHelpMap = {
       'SCHEDULE_RUN_IMMEDIATELY 仍是启动期行为；保存后不会立即触发一次分析。',
     ],
   },
+  'settings.system.decision_signal_outcomes': {
+    title: '决策信号后验追踪',
+    summary: '在定时调度进程中自动补齐决策信号的日线后验结果。',
+    usage: '先启用 SCHEDULE_ENABLED，再开启 DECISION_SIGNAL_OUTCOME_TRACKING_ENABLED；间隔单位为分钟，每轮批次上限为 1-500。',
+    valueNotes: [
+      '任务启动时先运行一次，之后按配置间隔补齐缺失结果，并重试行情数据可恢复的 unable。',
+      '只读取本地 DecisionSignal 与 StockDaily，不调用 LLM，也不修改原始信号。',
+    ],
+    impact: ['让信号表现统计持续积累可验证样本；watch、alert 和不支持的周期仍会如实记录为 unable。'],
+    notes: ['关闭自动追踪后仍可通过 outcomes/run API 手动评估。'],
+  },
   'settings.system.RUN_IMMEDIATELY': {
     title: '启动后立即运行',
     summary: '控制非定时模式启动时是否立即执行一次分析。',
@@ -1976,6 +1987,17 @@ const settingsHelpEnUS: SettingsHelpMap = {
       'Check the runtime timezone, especially in containers and servers.',
       'SCHEDULE_RUN_IMMEDIATELY remains a startup-time setting; saving it does not trigger an immediate analysis run.',
     ],
+  },
+  'settings.system.decision_signal_outcomes': {
+    title: 'Decision Signal Outcome Tracking',
+    summary: 'Automatically maintains daily-bar outcomes for DecisionSignal records while schedule mode is running.',
+    usage: 'Enable SCHEDULE_ENABLED first, then DECISION_SIGNAL_OUTCOME_TRACKING_ENABLED. The interval is in minutes and each batch accepts 1-500 signals.',
+    valueNotes: [
+      'The task runs once at scheduler startup, then fills missing outcomes and retries unable rows whose market data may recover.',
+      'It reads local DecisionSignal and StockDaily data only; it does not call an LLM or modify source signals.',
+    ],
+    impact: ['Continuously builds verifiable samples for signal statistics; watch, alert, and unsupported horizons remain explicitly unable.'],
+    notes: ['After disabling automatic tracking, outcomes can still be evaluated manually through the outcomes/run API.'],
   },
   'settings.system.RUN_IMMEDIATELY': {
     title: 'Run Immediately',

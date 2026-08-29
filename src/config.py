@@ -1052,6 +1052,9 @@ class Config:
     agent_event_monitor_enabled: bool = False  # Enable periodic event-driven alert checks in schedule mode
     agent_event_monitor_interval_minutes: int = 5  # Polling interval for event monitor background checks
     agent_event_alert_rules_json: str = ""  # JSON array of serialized EventMonitor rules
+    decision_signal_outcome_tracking_enabled: bool = False  # Evaluate signal outcomes in schedule mode
+    decision_signal_outcome_interval_minutes: int = 360  # Outcome evaluator polling interval
+    decision_signal_outcome_batch_limit: int = 500  # Maximum signals evaluated per maintenance run
 
     # === 通知配置（可同时配置多个，全部推送）===
     
@@ -2060,6 +2063,23 @@ class Config:
                 minimum=1,
             ),
             agent_event_alert_rules_json=os.getenv('AGENT_EVENT_ALERT_RULES_JSON', ''),
+            decision_signal_outcome_tracking_enabled=parse_env_bool(
+                os.getenv('DECISION_SIGNAL_OUTCOME_TRACKING_ENABLED'),
+                default=False,
+            ),
+            decision_signal_outcome_interval_minutes=parse_env_int(
+                os.getenv('DECISION_SIGNAL_OUTCOME_INTERVAL_MINUTES'),
+                360,
+                field_name='DECISION_SIGNAL_OUTCOME_INTERVAL_MINUTES',
+                minimum=1,
+            ),
+            decision_signal_outcome_batch_limit=parse_env_int(
+                os.getenv('DECISION_SIGNAL_OUTCOME_BATCH_LIMIT'),
+                500,
+                field_name='DECISION_SIGNAL_OUTCOME_BATCH_LIMIT',
+                minimum=1,
+                maximum=500,
+            ),
             wechat_webhook_url=os.getenv('WECHAT_WEBHOOK_URL'),
             feishu_webhook_url=os.getenv('FEISHU_WEBHOOK_URL'),
             feishu_webhook_secret=os.getenv('FEISHU_WEBHOOK_SECRET'),

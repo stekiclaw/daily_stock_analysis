@@ -128,6 +128,9 @@ class MainScheduleModeTestCase(unittest.TestCase):
             "agent_event_monitor_enabled": False,
             "agent_event_alert_rules_json": "",
             "agent_event_monitor_interval_minutes": 5,
+            "decision_signal_outcome_tracking_enabled": False,
+            "decision_signal_outcome_interval_minutes": 360,
+            "decision_signal_outcome_batch_limit": 500,
             "daily_market_context_enabled": True,
         }
         defaults.update(overrides)
@@ -725,6 +728,55 @@ class MainScheduleModeTestCase(unittest.TestCase):
 
         worker.run_once.assert_called_once_with()
         info_log.assert_any_call("[EventMonitor] 本轮触发 %d 条提醒", 2)
+
+    def test_schedule_mode_registers_decision_signal_outcome_background_task(self) -> None:
+        args = self._make_args(schedule=True)
+        config = self._make_config(
+            schedule_enabled=False,
+            decision_signal_outcome_tracking_enabled=True,
+            decision_signal_outcome_interval_minutes=90,
+            decision_signal_outcome_batch_limit=321,
+        )
+        outcome_service = MagicMock()
+        outcome_service.run_outcomes.return_value = {
+            "evaluated": 2,
+            "created": 1,
+            "updated": 1,
+            "skipped": 0,
+        }
+        scheduled_call = {}
+
+        def fake_run_with_schedule(
+            task,
+            schedule_time,
+            run_immediately,
+            background_tasks=None,
+            schedule_time_provider=None,
+        ):
+            scheduled_call["background_tasks"] = background_tasks or []
+
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main._reload_runtime_config", return_value=config), \
+             patch("main._build_schedule_time_provider", return_value=lambda: "18:00"), \
+             patch("main.setup_logging"), \
+             patch("main.run_full_analysis") as run_full_analysis, \
+             patch(
+                 "src.services.decision_signal_outcome_service.DecisionSignalOutcomeService",
+                 return_value=outcome_service,
+             ), \
+             patch("src.scheduler.run_with_schedule", side_effect=fake_run_with_schedule):
+            exit_code = main.main()
+
+        self.assertEqual(exit_code, 0)
+        run_full_analysis.assert_not_called()
+        self.assertEqual(len(scheduled_call["background_tasks"]), 1)
+        background_task = scheduled_call["background_tasks"][0]
+        self.assertEqual(background_task["name"], "decision_signal_outcomes")
+        self.assertEqual(background_task["interval_seconds"], 90 * 60)
+        self.assertTrue(background_task["run_immediately"])
+        background_task["task"]()
+        outcome_service.run_outcomes.assert_called_once_with(limit=321)
 
     def test_schedule_mode_registers_event_monitor_worker_without_legacy_rules(self) -> None:
         args = self._make_args(schedule=True)
