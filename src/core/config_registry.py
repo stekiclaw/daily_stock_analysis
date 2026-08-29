@@ -1300,6 +1300,24 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {},
         "display_order": 53,
     },
+    "YFINANCE_NEWS_ENABLED": {
+        "title": "Yahoo Finance News Fallback",
+        "description": (
+            "Fetch per-symbol headlines from Yahoo Finance when the metered search "
+            "providers are exhausted or blocked. No API key and no quota. Best coverage "
+            "for US equities, ETFs and indices; A-share coverage is sparse. Default: true."
+        ),
+        "category": "data_source",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "true",
+        "options": [],
+        "validation": {},
+        "display_order": 54,
+    },
     "ENABLE_REALTIME_QUOTE": {
         "title": "Enable Realtime Quote",
         "description": "Enable realtime market quotes. Disable to only use historical close prices.",
@@ -4877,6 +4895,15 @@ _FIELD_HELP_METADATA: Dict[str, Dict[str, Any]] = {
         ],
         "docs": _DOC_FULL_GUIDE_SEARCH,
         "warning_codes": ["public_instance_stability"],
+    },
+    "YFINANCE_NEWS_ENABLED": {
+        "help_key": "settings.data_source.SEARXNG_BASE_URLS",
+        "examples": [
+            "YFINANCE_NEWS_ENABLED=true",
+            "YFINANCE_NEWS_ENABLED=false",
+        ],
+        "docs": _DOC_FULL_GUIDE_SEARCH,
+        "warning_codes": [],
     },
     "BIAS_THRESHOLD": {
         "help_key": "settings.data_source.BIAS_THRESHOLD",

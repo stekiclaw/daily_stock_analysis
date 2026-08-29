@@ -956,3 +956,13 @@ if __name__ == "__main__":
         print(df.tail())
     except Exception as e:
         print(f"获取失败: {e}")
+
+
+def to_yahoo_symbol(stock_code: str) -> str:
+    """Public entry point for the Yahoo symbol conversion.
+
+    Other modules (e.g. the news search provider) need the same A-share /
+    HK / US mapping the fetcher already implements; this keeps that logic in
+    one place instead of re-deriving it per caller.
+    """
+    return YfinanceFetcher()._convert_stock_code(stock_code)

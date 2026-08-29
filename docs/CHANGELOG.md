@@ -227,6 +227,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] `codex_oauth` 生成后端此前被若干仅判断本地 CLI 后端的分支漏掉，导致：配置预检不校验 OAuth 凭证、未配置任何 LiteLLM 渠道时 `has_configured_llm_runtime()` 误判为不可用而拦截大盘复盘、启动日志误报未配置 LLM、`[LLM配置]` 日志标注成 LiteLLM 模型名。改为统一按「非 LiteLLM 生成后端」判断。
 - [改进] 设置页保存后新增提示：当某项配置同时由启动期进程环境变量注入（Docker `env_file` / `environment`、shell export）时，本次保存虽对当前进程立即生效，但进程重启会被环境变量重新覆盖而悄悄回滚；提示会列出受影响的配置项并说明需同步修改注入来源。
 - [新功能] 问股 Chat 支持 `AGENT_BACKEND=codex_oauth`：用同一份 ChatGPT/Codex OAuth 凭证直接跑工具调用，不再需要 LiteLLM 渠道或按量计费的 `OPENAI_API_KEY`。DSA 仍拥有 Agent 循环（工具执行、并行调用、超时、进度与取消行为不变），新增的适配层只负责消息与工具声明在 OpenAI chat 格式与 Responses `function_call` / `function_call_output` 之间的转换。新增 `AGENT_CODEX_OAUTH_MODEL`，留空继承 `CODEX_OAUTH_MODEL`，可让问股与报告生成使用不同型号。
+- [新功能] 新增 Yahoo Finance 新闻兜底源（无需 API Key、无配额）：按标的直接取新闻，排在计费检索源与 SearXNG 之后。此前 Tavily 免费额度耗尽、Brave 月度额度用尽、自建 SearXNG 的 google/startpage/duckduckgo 引擎被 CAPTCHA 与限流拦截时，个股与大盘分析会在「零新闻」状态下进行；该源保证这种情况下仍有新闻输入。大盘复盘按 region 取对应指数（美股 ^GSPC/^IXIC）的新闻，`search_stock_news()` 相应新增可选 `region` 参数。美股与港股覆盖良好，A 股仅有英文媒体的零星报道。
 
 ## [3.27.0] - 2026-07-19
 

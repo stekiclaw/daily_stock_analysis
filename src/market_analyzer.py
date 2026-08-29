@@ -755,7 +755,8 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                     stock_code="market",
                     stock_name=market_name,
                     max_results=3,
-                    focus_keywords=query.split()
+                    focus_keywords=query.split(),
+                    region=self.region,
                 )
                 if response and response.results:
                     all_news.extend(response.results)

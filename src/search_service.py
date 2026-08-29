@@ -281,6 +281,11 @@ class SearchResponse:
 
 class BaseSearchProvider(ABC):
     """搜索引擎基类"""
+
+    # Whether the provider can answer a free-text query. Web search engines
+    # can; a source keyed to one symbol cannot, and must be skipped by the
+    # open-ended intelligence paths instead of failing there.
+    supports_open_ended_queries: bool = True
     
     def __init__(self, api_keys: List[str], name: str):
         """
@@ -2220,6 +2225,170 @@ class SearXNGSearchProvider(BaseSearchProvider):
         )
 
 
+class YFinanceNewsProvider(BaseSearchProvider):
+    """Ticker-scoped headlines from Yahoo Finance.
+
+    Unlike every other provider here this is not a web search: it asks Yahoo
+    for the news already attached to one symbol. That makes it a poor fit for
+    open-ended intelligence queries, but it needs no API key and has no quota,
+    so it keeps working when the metered providers are exhausted and the
+    SearXNG engines are being CAPTCHA-walled - which is exactly when the
+    analysis would otherwise run on no news at all.
+
+    Coverage is best for US equities, ETFs and indices; A-share symbols return
+    only what English-language outlets happen to publish.
+    """
+
+    # The market-review path searches with a "market" sentinel rather than a
+    # symbol, so map it onto the indices that carry market-wide headlines.
+    MARKET_INDEX_TICKERS = {
+        "us": ["^GSPC", "^IXIC"],
+        "hk": ["^HSI"],
+        "cn": ["000001.SS"],
+        "jp": ["^N225"],
+        "kr": ["^KS11"],
+    }
+    MARKET_SENTINEL = "market"
+    supports_open_ended_queries = False
+
+    def __init__(self) -> None:
+        # No credential to rotate; the base class only needs a non-empty pool.
+        super().__init__(["yfinance"], "YFinanceNews")
+
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    def search(
+        self,
+        query: str,
+        max_results: int = 5,
+        days: int = 7,
+        stock_code: Optional[str] = None,
+        region: Optional[str] = None,
+    ) -> SearchResponse:
+        """Look up news for the symbol behind ``stock_code``."""
+        tickers = self._resolve_tickers(stock_code, region)
+        if not tickers:
+            # Not a provider failure - this source simply does not apply to
+            # this code. Returning before _execute_search keeps it out of the
+            # key error accounting, which exists for real fetch failures.
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"{self._name} 无法从 '{stock_code}' 解析出 Yahoo 代码",
+            )
+        return self._execute_search(
+            query,
+            max_results=max_results,
+            days=days,
+            tickers=tickers,
+        )
+
+    def _resolve_tickers(
+        self, stock_code: Optional[str], region: Optional[str]
+    ) -> List[str]:
+        code = (stock_code or "").strip()
+        if not code:
+            return []
+        if code.lower() == self.MARKET_SENTINEL:
+            return list(self.MARKET_INDEX_TICKERS.get((region or "us").lower(), []))
+        try:
+            from data_provider.yfinance_fetcher import to_yahoo_symbol
+
+            symbol = to_yahoo_symbol(code)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("[%s] 无法映射代码 %s: %s", self._name, code, exc)
+            return []
+        return [symbol] if symbol else []
+
+    @staticmethod
+    def _parse_published(raw: Any) -> Optional[datetime]:
+        if not raw or not isinstance(raw, str):
+            return None
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    def _do_search(
+        self,
+        query: str,
+        api_key: str,
+        max_results: int,
+        days: int = 7,
+        tickers: Optional[List[str]] = None,
+    ) -> SearchResponse:
+        tickers = list(tickers or [])
+        try:
+            import yfinance as yf
+        except ImportError:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message="yfinance 未安装",
+            )
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, days))
+        results: List[SearchResult] = []
+        seen_urls: set = set()
+
+        for ticker in tickers:
+            try:
+                items = yf.Ticker(ticker).news or []
+            except Exception as exc:
+                logger.warning("[%s] %s 拉取新闻失败: %s", self._name, ticker, exc)
+                continue
+
+            for item in items:
+                content = item.get("content") if isinstance(item, dict) else None
+                if not isinstance(content, dict):
+                    continue
+                published = self._parse_published(content.get("pubDate"))
+                if published is not None and published < cutoff:
+                    continue
+                url = ""
+                for key in ("canonicalUrl", "clickThroughUrl"):
+                    candidate = content.get(key)
+                    if isinstance(candidate, dict) and candidate.get("url"):
+                        url = str(candidate["url"])
+                        break
+                if url and url in seen_urls:
+                    continue
+                if url:
+                    seen_urls.add(url)
+                provider_meta = content.get("provider")
+                source = (
+                    str(provider_meta.get("displayName") or "")
+                    if isinstance(provider_meta, dict)
+                    else ""
+                )
+                results.append(
+                    SearchResult(
+                        title=str(content.get("title") or "").strip(),
+                        # ``description`` is HTML; ``summary`` is the plain-text one.
+                        snippet=str(content.get("summary") or "").strip(),
+                        url=url,
+                        source=source or "Yahoo Finance",
+                        published_date=(
+                            published.isoformat() if published is not None else None
+                        ),
+                    )
+                )
+
+        results = [item for item in results if item.title]
+        return SearchResponse(
+            query=query,
+            results=results[:max_results],
+            provider=self._name,
+            success=True,
+        )
+
+
 class SearchService:
     """
     搜索服务
@@ -2390,6 +2559,7 @@ class SearchService:
         minimax_keys: Optional[List[str]] = None,
         searxng_base_urls: Optional[List[str]] = None,
         searxng_public_instances_enabled: bool = False,
+        yfinance_news_enabled: bool = True,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
     ):
@@ -2405,6 +2575,7 @@ class SearchService:
             minimax_keys: MiniMax API Key 列表
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
+            yfinance_news_enabled: 是否启用 Yahoo Finance 新闻兜底源（无需 API Key）
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
@@ -2475,6 +2646,13 @@ class SearchService:
                 logger.info("已配置 SearXNG 搜索，共 %s 个自建实例", len(searxng_base_urls))
             else:
                 logger.info("已启用 SearXNG 公共实例自动发现模式")
+
+        # 6.5 Yahoo Finance 新闻（无 key、无配额，作为保底源）。
+        # 排在最后：它只能按标的取新闻，答不了开放式检索，但在计费源额度耗尽、
+        # SearXNG 引擎被 CAPTCHA 拦截时，它是唯一还能产出新闻的来源。
+        if yfinance_news_enabled:
+            self._providers.append(YFinanceNewsProvider())
+            logger.info("已启用 Yahoo Finance 新闻兜底源（无需 API Key）")
 
         # 7. Anspire Search（实时智能搜索优化）
         if anspire_keys:
@@ -3995,7 +4173,8 @@ class SearchService:
         stock_code: str,
         stock_name: str,
         max_results: int = 5,
-        focus_keywords: Optional[List[str]] = None
+        focus_keywords: Optional[List[str]] = None,
+        region: Optional[str] = None,
     ) -> SearchResponse:
         """
         搜索股票相关新闻
@@ -4005,6 +4184,8 @@ class SearchService:
             stock_name: 股票名称
             max_results: 最大返回结果数
             focus_keywords: 重点关注的关键词列表
+            region: 市场地区（cn/us/hk/jp/kr）。仅在 stock_code 为 "market"
+                的大盘检索中需要，用于挑选对应的指数代码。
             
         Returns:
             SearchResponse 对象
@@ -4106,6 +4287,10 @@ class SearchService:
                 search_kwargs: Dict[str, Any] = {}
                 if isinstance(provider, TavilySearchProvider):
                     search_kwargs["topic"] = "news"
+                elif isinstance(provider, YFinanceNewsProvider):
+                    # It looks up a symbol rather than running the text query.
+                    search_kwargs["stock_code"] = stock_code
+                    search_kwargs["region"] = region
                 elif isinstance(provider, BraveSearchProvider):
                     search_kwargs.update(
                         self._brave_search_locale(
@@ -4330,7 +4515,9 @@ class SearchService:
         
         # 依次尝试各个搜索引擎
         for provider in self._providers:
-            if not provider.is_available:
+            if not provider.is_available or not getattr(
+                provider, "supports_open_ended_queries", True
+            ):
                 continue
             
             response = provider.search(query, max_results=5)
@@ -4514,7 +4701,13 @@ class SearchService:
                 break
             
             # 选择搜索引擎（轮流使用）
-            available_providers = [p for p in self._providers if p.is_available]
+            available_providers = [
+                p
+                for p in self._providers
+                # Duck-typed providers (tests, plugins) predate the flag, so a
+                # missing attribute keeps the previous "can be asked anything".
+                if p.is_available and getattr(p, "supports_open_ended_queries", True)
+            ]
             if not available_providers:
                 break
             
@@ -4742,7 +4935,9 @@ class SearchService:
             
             # 依次尝试各个搜索引擎
             for provider in self._providers:
-                if not provider.is_available:
+                if not provider.is_available or not getattr(
+                    provider, "supports_open_ended_queries", True
+                ):
                     continue
                 
                 try:
@@ -4890,6 +5085,7 @@ def get_search_service() -> SearchService:
                     minimax_keys=config.minimax_api_keys,
                     searxng_base_urls=config.searxng_base_urls,
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
+                    yfinance_news_enabled=getattr(config, "yfinance_news_enabled", True),
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )
