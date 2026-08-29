@@ -55,6 +55,50 @@ import os
 logger = logging.getLogger(__name__)
 
 
+def _compute_yfinance_volume_signals(
+    volume: Optional[float],
+    ticker_info: Dict[str, Any],
+) -> "tuple[Optional[float], Optional[float]]":
+    """Derive 量比/换手率 from fields already present in ``ticker.info``.
+
+    These two fields used to be hardcoded to ``None`` for every Yfinance quote
+    (issue: every US/JP/KR/TW report was missing the volume-based signal the
+    analysis prompt explicitly asks the model to reason about), even though
+    ``ticker.info`` already carries what's needed to derive them and is fetched
+    unconditionally a few lines above this call for pe_ratio/pb_ratio — no
+    extra request.
+
+    Yahoo has no clean 5-trading-day average (the A股 convention used
+    elsewhere in this codebase, e.g. ``LongbridgeFetcher._compute_volume_ratio``);
+    the closest available window without an extra request is the 10-day
+    average (``averageVolume10days``), falling back to the ~3-month average
+    (``averageVolume``) when the 10-day figure is absent. So this is a
+    reasonable approximation of 量比, not an exact match to the A股 definition.
+    Turnover uses float shares (``floatShares``) over total shares outstanding
+    when available, since restricted/insider shares are not actually
+    tradable and would understate turnover.
+    """
+    if not volume or volume <= 0:
+        return None, None
+
+    average_volume = _safe_float(ticker_info.get("averageVolume10days")) or _safe_float(
+        ticker_info.get("averageVolume")
+    )
+    volume_ratio = (
+        round(volume / average_volume, 2) if average_volume and average_volume > 0 else None
+    )
+
+    turnover_shares = _safe_float(ticker_info.get("floatShares")) or _safe_float(
+        ticker_info.get("sharesOutstanding")
+    )
+    turnover_rate = (
+        round(volume / turnover_shares * 100, 4)
+        if turnover_shares and turnover_shares > 0
+        else None
+    )
+    return volume_ratio, turnover_rate
+
+
 class YfinanceFetcher(BaseFetcher):
     """
     Yahoo Finance 数据源实现
@@ -895,6 +939,7 @@ class YfinanceFetcher(BaseFetcher):
             # 复用上方已获取的 ticker_info，无额外请求
             pe_ratio = _safe_float(ticker_info.get('trailingPE'))
             pb_ratio = _safe_float(ticker_info.get('priceToBook'))
+            volume_ratio, turnover_rate = _compute_yfinance_volume_signals(volume, ticker_info)
 
             missing_fields = [
                 field
@@ -921,8 +966,8 @@ class YfinanceFetcher(BaseFetcher):
                 change_amount=round(change_amount, 4) if change_amount is not None else None,
                 volume=volume,
                 amount=None,  # yfinance 不直接提供成交额
-                volume_ratio=None,
-                turnover_rate=None,
+                volume_ratio=volume_ratio,
+                turnover_rate=turnover_rate,
                 amplitude=round(amplitude, 2) if amplitude is not None else None,
                 open_price=open_price,
                 high=high,

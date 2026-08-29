@@ -49,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 阻止任意更新的非 bundled 指数候选（含 legacy `static` 子集）在 remote 缺失/损坏时以 active-index 子集覆盖 bundled baseline：所有非 bundled 候选必须为 bundled active-index canonical 集合的合法超集，否则回退 bundled 并记录 WARNING。
 - [新功能] 桌面端全局右上角增加更新入口，与设置页共用更新状态；普通浏览器 WebUI 不展示，且不会在挂载时重复触发后台检查。
 - [修复] 桌面端右上角更新入口与设置页共用检查中状态，避免一侧检查时另一侧仍可重复触发 GitHub Releases 检查；主进程手动检查路径同步增加 in-flight 防重。
+- [修复] `YfinanceFetcher` 不再把量比/换手率硬编码为空：复用同一次请求已拉取的 `ticker.info`（无额外请求）换算量比（优先 10 日均量，退回约 3 个月均量近似 A 股 5 日口径）与换手率（优先流通股本），此前美股/日股/韩股/台股报告的这两个字段永远是 N/A，模型无法据此判断放量/缩量。
+- [修复] 筹码分布：区分"该市场/品种结构性不支持"（美股/港股/ETF/指数）与"抓取失败"——新增 `DataFetcherManager.is_chip_distribution_unsupported_market`，pipeline 据此把前者标记为 `chip_not_supported` 元数据；`AnalysisContextBuilder` 已有的 NOT_SUPPORTED 判定分支此前从未被写入过，所有非 A 股报告的筹码数据质量分因此被误判为抓取失败（35/100）而非结构性不适用（70/100）。
 
 ## [3.31.0] - 2026-08-23
 

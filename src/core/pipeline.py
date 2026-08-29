@@ -540,8 +540,13 @@ class StockAnalysisPipeline:
             # Step 2: 获取筹码分布 - 使用统一入口，带熔断保护
             # 指数目标跳过筹码分布（INDEX_SKIP_MODULES 能力矩阵）
             chip_data = None
+            # 区分"该市场/品种结构性不提供筹码分布"（例如美股/港股/ETF/指数）
+            # 与"抓取失败"，避免前者被 analysis_context_builder 当作数据质量
+            # 问题降级（详见 DataFetcherManager.is_chip_distribution_unsupported_market）。
+            chip_not_supported = False
             if is_index and "chip_distribution" in INDEX_SKIP_MODULES:
                 logger.debug(f"{stock_name}({code}) 指数目标跳过筹码分布")
+                chip_not_supported = True
             else:
                 try:
                     chip_data = self.fetcher_manager.get_chip_distribution(code)
@@ -549,6 +554,7 @@ class StockAnalysisPipeline:
                         logger.info(f"{stock_name}({code}) 筹码分布: 获利比例={chip_data.profit_ratio:.1%}, "
                                   f"90%集中度={chip_data.concentration_90:.2%}")
                     else:
+                        chip_not_supported = self.fetcher_manager.is_chip_distribution_unsupported_market(code)
                         logger.debug(f"{stock_name}({code}) 筹码分布获取失败或已禁用")
                 except Exception as e:
                     logger.warning(f"{stock_name}({code}) 获取筹码分布失败: {e}")
@@ -811,6 +817,7 @@ class StockAnalysisPipeline:
                     realtime_quote=realtime_quote,
                     trend_result=trend_result,
                     chip_data=chip_data,
+                    chip_not_supported=chip_not_supported,
                     fundamental_context=fundamental_context,
                     news_context=news_context,
                     news_result_count=news_result_count,
@@ -3086,7 +3093,14 @@ class StockAnalysisPipeline:
         news_result_count: Optional[int],
         query_id: str,
         portfolio_context: Optional[Dict[str, Any]] = None,
+        chip_not_supported: bool = False,
     ) -> PipelineAnalysisArtifacts:
+        metadata: Dict[str, Any] = {
+            "query_id": query_id,
+            "trigger_source": self.query_source,
+        }
+        if chip_not_supported:
+            metadata["chip_not_supported"] = True
         return PipelineAnalysisArtifacts(
             code=code,
             stock_name=stock_name,
@@ -3100,10 +3114,7 @@ class StockAnalysisPipeline:
             fundamental_context=fundamental_context,
             news_context=news_context,
             news_result_count=news_result_count,
-            metadata={
-                "query_id": query_id,
-                "trigger_source": self.query_source,
-            },
+            metadata=metadata,
             portfolio_context=dict(portfolio_context) if isinstance(portfolio_context, dict) else None,
         )
 

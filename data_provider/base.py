@@ -2989,6 +2989,24 @@ class DataFetcherManager:
         logger.warning(f"[筹码分布] {stock_code} 所有数据源均失败")
         return None
 
+    def is_chip_distribution_unsupported_market(self, stock_code: str) -> bool:
+        """是否属于筹码分布结构性不覆盖的市场/品种。
+
+        筹码分布（成本分布）目前只有 A 股个股支持——底层依赖 akshare 的
+        ``stock_cyq_em``，是 A 股专属接口，美股/港股/ETF/指数都没有对应数据。
+        调用方用这个结果区分"该市场/品种本就不提供这项数据"与"抓取失败"，
+        避免把结构性覆盖缺口当作数据质量问题处理（对应各 Fetcher 内部的
+        ``[API跳过] ... 无筹码分布数据`` 分支，这里做统一判定，不逐个数据源猜测）。
+        """
+        stock_code = normalize_stock_code(stock_code)
+        from .akshare_fetcher import _is_etf_code, _is_hk_code, _is_us_code
+
+        return (
+            _is_us_code(stock_code)
+            or _is_hk_code(stock_code)
+            or _is_etf_code(stock_code)
+        )
+
     def get_stock_name(self, stock_code: str, allow_realtime: bool = True) -> Optional[str]:
         """
         获取股票中文名称（自动切换数据源）
