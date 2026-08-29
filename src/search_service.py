@@ -4548,6 +4548,101 @@ class SearchService:
                 return provider
         return None
 
+    def _search_intel_provider(
+        self,
+        provider: BaseSearchProvider,
+        dimension: Dict[str, Any],
+        *,
+        stock_code: str,
+        max_results: int,
+        request_days: int,
+    ) -> SearchResponse:
+        """Execute one intelligence query while preserving provider extensions."""
+        try:
+            if isinstance(provider, YFinanceNewsProvider):
+                return provider.search(
+                    dimension["query"],
+                    max_results=max_results,
+                    days=request_days,
+                    stock_code=stock_code,
+                )
+            if isinstance(provider, TavilySearchProvider) and dimension.get("tavily_topic"):
+                return provider.search(
+                    dimension["query"],
+                    max_results=max_results,
+                    days=request_days,
+                    topic=dimension["tavily_topic"],
+                )
+            return provider.search(
+                dimension["query"],
+                max_results=max_results,
+                days=request_days,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[情报搜索] %s: %s 搜索异常 - %s",
+                dimension["desc"],
+                provider.name,
+                exc,
+            )
+            return SearchResponse(
+                query=dimension["query"],
+                results=[],
+                provider=provider.name,
+                success=False,
+                error_message=str(exc),
+            )
+
+    def _prepare_intel_response(
+        self,
+        response: SearchResponse,
+        dimension: Dict[str, Any],
+        *,
+        provider_name: str,
+        stock_code: str,
+        stock_name: str,
+        search_days: int,
+        max_results: int,
+        target_results: int,
+    ) -> SearchResponse:
+        """Apply the same freshness, ranking, and admission gates per attempt."""
+        if dimension["strict_freshness"]:
+            prepared = self._filter_news_response(
+                response,
+                search_days=search_days,
+                max_results=max_results,
+                log_scope=f"{stock_code}:{provider_name}:{dimension['name']}",
+            )
+        elif dimension["name"] in self.ANALYTICAL_INTEL_DIMENSIONS:
+            prepared = self._filter_news_response(
+                response,
+                search_days=self.ANALYTICAL_INTEL_LOOKBACK_DAYS,
+                max_results=max_results,
+                keep_unknown=True,
+                log_scope=f"{stock_code}:{provider_name}:{dimension['name']}",
+            )
+        else:
+            prepared = self._normalize_and_limit_response(
+                response,
+                max_results=max_results,
+            )
+        prepared = self._rank_news_response(
+            prepared,
+            stock_code=stock_code,
+            stock_name=stock_name,
+            prefer_chinese=self._should_prefer_chinese_news(stock_code, stock_name),
+            max_results=max_results,
+            log_scope=f"{stock_code}:{provider_name}:{dimension['name']}:rank",
+        )
+        prepared = self._filter_ranked_news_for_context(
+            prepared,
+            log_scope=f"{stock_code}:{provider_name}:{dimension['name']}:admission",
+        )
+        return self._limit_search_response(
+            prepared,
+            max_results=target_results,
+        )
+
     def search_comprehensive_intel(
         self,
         stock_code: str,
@@ -4733,113 +4828,78 @@ class SearchService:
             if not available_providers:
                 break
             
-            provider = available_providers[provider_index % len(available_providers)]
+            primary_index = provider_index % len(available_providers)
             provider_index += 1
-            
+            providers_to_try = (
+                available_providers[primary_index:]
+                + available_providers[:primary_index]
+            )
+
             request_days = (
                 self.ANALYTICAL_INTEL_LOOKBACK_DAYS
                 if dim['name'] in self.ANALYTICAL_INTEL_DIMENSIONS
                 else search_days
             )
-
-            logger.info(
-                "[情报搜索] %s: 使用 %s，请求窗口: 近%s天",
-                dim['desc'],
-                provider.name,
-                request_days,
+            response = SearchResponse(
+                query=dim["query"],
+                results=[],
+                provider="None",
+                success=False,
+                error_message="没有可用搜索结果",
             )
+            filtered_response = response
 
-            if isinstance(provider, YFinanceNewsProvider):
-                response = provider.search(
-                    dim['query'],
-                    max_results=provider_max_results,
-                    days=request_days,
-                    stock_code=stock_code,
-                )
-            elif isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
-                response = provider.search(
-                    dim['query'],
-                    max_results=provider_max_results,
-                    days=request_days,
-                    topic=dim['tavily_topic'],
-                )
-            else:
-                response = provider.search(
-                    dim['query'],
-                    max_results=provider_max_results,
-                    days=request_days,
-                )
-
-            # Only one provider is tried per dimension, so a provider that is
-            # out of quota leaves the dimension empty. For dimensions that are
-            # simply "news about this symbol" the keyless source can still
-            # answer, so fall back to it rather than returning nothing.
-            if dimension_is_symbol_servable and not response.results:
-                fallback = self._symbol_scoped_news_provider(exclude=provider)
-                if fallback is not None:
+            for attempt, provider in enumerate(providers_to_try):
+                if attempt == 0:
                     logger.info(
-                        "[情报搜索] %s: %s 无结果，回退到 %s",
+                        "[情报搜索] %s: 使用 %s，请求窗口: 近%s天",
                         dim['desc'],
                         provider.name,
-                        fallback.name,
+                        request_days,
                     )
-                    fallback_response = fallback.search(
-                        dim['query'],
-                        max_results=provider_max_results,
-                        days=request_days,
-                        stock_code=stock_code,
+                else:
+                    logger.info(
+                        "[情报搜索] %s: 前序渠道无可用结果，回退到 %s",
+                        dim['desc'],
+                        provider.name,
                     )
-                    if fallback_response.results:
-                        response = fallback_response
 
-            if dim['strict_freshness']:
-                filtered_response = self._filter_news_response(
+                response = self._search_intel_provider(
+                    provider,
+                    dim,
+                    stock_code=stock_code,
+                    max_results=provider_max_results,
+                    request_days=request_days,
+                )
+                filtered_response = self._prepare_intel_response(
                     response,
+                    dim,
+                    provider_name=provider.name,
+                    stock_code=stock_code,
+                    stock_name=stock_name,
                     search_days=search_days,
                     max_results=provider_max_results,
-                    log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
+                    target_results=target_per_dimension,
                 )
-            elif dim['name'] in self.ANALYTICAL_INTEL_DIMENSIONS:
-                filtered_response = self._filter_news_response(
-                    response,
-                    search_days=self.ANALYTICAL_INTEL_LOOKBACK_DAYS,
-                    max_results=provider_max_results,
-                    keep_unknown=True,
-                    log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
-                )
-            else:
-                filtered_response = self._normalize_and_limit_response(
-                    response,
-                    max_results=provider_max_results,
-                )
-            filtered_response = self._rank_news_response(
-                filtered_response,
-                stock_code=stock_code,
-                stock_name=stock_name,
-                prefer_chinese=self._should_prefer_chinese_news(stock_code, stock_name),
-                max_results=provider_max_results,
-                log_scope=f"{stock_code}:{provider.name}:{dim['name']}:rank",
-            )
-            filtered_response = self._filter_ranked_news_for_context(
-                filtered_response,
-                log_scope=f"{stock_code}:{provider.name}:{dim['name']}:admission",
-            )
-            filtered_response = self._limit_search_response(
-                filtered_response,
-                max_results=target_per_dimension,
-            )
-            results[dim['name']] = filtered_response
-            search_count += 1
-            
-            if response.success:
                 logger.info(
-                    "[情报搜索] %s: 原始=%s条, 过滤后=%s条",
+                    "[情报搜索] %s/%s: 原始=%s条, 过滤后=%s条",
                     dim['desc'],
+                    provider.name,
                     len(response.results),
                     len(filtered_response.results),
                 )
-            else:
-                logger.warning(f"[情报搜索] {dim['desc']}: 搜索失败 - {response.error_message}")
+                if filtered_response.results:
+                    break
+                if not response.success:
+                    logger.warning(
+                        "[情报搜索] %s/%s: 搜索失败 - %s",
+                        dim['desc'],
+                        provider.name,
+                        response.error_message,
+                    )
+
+            results[dim['name']] = filtered_response
+            search_count += 1
             
             # 短暂延迟避免请求过快
             time.sleep(0.5)

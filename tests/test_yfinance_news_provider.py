@@ -237,6 +237,65 @@ def test_news_dimension_falls_back_when_the_chosen_provider_returns_nothing(
     assert "Fallback headline" in titles
 
 
+def test_open_ended_dimension_fails_over_to_another_capable_provider(monkeypatch):
+    """Quota exhaustion on the rotated primary must not zero an analytical dimension."""
+    from src.search_service import SearchResponse, SearchResult, SearchService
+
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    class _Provider:
+        supports_open_ended_queries = True
+        is_available = True
+
+        def __init__(self, name):
+            self.name = name
+            self.calls = []
+
+        def search(self, query, max_results=5, days=7, **kwargs):
+            self.calls.append(query)
+            is_analysis = "analyst rating" in query
+            if self.name == "Secondary" and is_analysis:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message="quota exhausted",
+                )
+            title = (
+                "NVIDIA analyst raises target price after earnings"
+                if is_analysis
+                else "NVIDIA announces a new AI platform"
+            )
+            return SearchResponse(
+                query=query,
+                results=[SearchResult(
+                    title=title,
+                    snippet="NVIDIA company update with material investor context.",
+                    url=f"https://example.com/{self.name}/{len(self.calls)}",
+                    source=self.name,
+                    published_date=today,
+                )],
+                provider=self.name,
+                success=True,
+            )
+
+    primary = _Provider("Primary")
+    secondary = _Provider("Secondary")
+    service = SearchService(searxng_public_instances_enabled=False)
+    service._providers = [primary, secondary]
+    monkeypatch.setattr("src.search_service.time.sleep", lambda _seconds: None)
+
+    responses = service.search_comprehensive_intel("NVDA", "NVIDIA", max_searches=2)
+
+    # latest_news starts at Primary; round-robin makes market_analysis start at
+    # Secondary, whose exhausted response must fall back to Primary.
+    assert responses["market_analysis"].provider == "Primary"
+    assert responses["market_analysis"].results
+    assert len(secondary.calls) == 1
+    assert len(primary.calls) == 2
+
+
 def test_open_ended_dimension_does_not_fall_back_to_the_symbol_source(
     fake_yf, monkeypatch
 ):
