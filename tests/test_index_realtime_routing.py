@@ -133,6 +133,27 @@ class IndexRealtimeRoutingTestCase(unittest.TestCase):
         self.assertEqual(efinance.calls, ["csi930955"])
         self.assertEqual(akshare.calls, [])
 
+    def test_us_index_does_not_fallback_to_longbridge(self):
+        yfinance = MagicMock()
+        yfinance.name = "YfinanceFetcher"
+        yfinance.priority = 4
+        yfinance.is_available_for_request.return_value = True
+        yfinance.get_realtime_quote.return_value = None
+
+        longbridge = MagicMock()
+        longbridge.name = "LongbridgeFetcher"
+        longbridge.priority = 5
+        longbridge.is_available_for_request.return_value = True
+        longbridge.get_realtime_quote.return_value = _quote("SPX")
+
+        manager = self._manager([yfinance, longbridge])
+        with patch("src.config.get_config", return_value=self._config()):
+            quote = manager.get_realtime_quote("SPX")
+
+        self.assertIsNone(quote)
+        yfinance.get_realtime_quote.assert_called_once_with("SPX")
+        longbridge.get_realtime_quote.assert_not_called()
+
     def test_bare_code_stays_on_stock_path(self):
         akshare = _FakeAkshareFetcher()
         manager = self._manager([_FakeEfinanceFetcher(), akshare])
