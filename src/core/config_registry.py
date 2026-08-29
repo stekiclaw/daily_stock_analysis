@@ -1305,7 +1305,8 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": (
             "Fetch per-symbol headlines from Yahoo Finance when the metered search "
             "providers are exhausted or blocked. No API key and no quota. Best coverage "
-            "for US equities, ETFs and indices; A-share coverage is sparse. Default: true."
+            "for US equities, ETFs and indices; A-share coverage is sparse. Default: false - "
+            "enable it to keep news flowing when the metered providers run dry."
         ),
         "category": "data_source",
         "data_type": "boolean",
@@ -1313,7 +1314,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "is_sensitive": False,
         "is_required": False,
         "is_editable": True,
-        "default_value": "true",
+        "default_value": "false",
         "options": [],
         "validation": {},
         "display_order": 54,

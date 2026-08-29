@@ -996,7 +996,7 @@ class Config:
     serpapi_keys: List[str] = field(default_factory=list)  # SerpAPI Keys
     searxng_base_urls: List[str] = field(default_factory=list)  # SearXNG instance URLs (self-hosted, no quota)
     searxng_public_instances_enabled: bool = False  # Opt in to public discovery when base URLs are absent
-    yfinance_news_enabled: bool = True  # Yahoo Finance news fallback (no API key, no quota)
+    yfinance_news_enabled: bool = False  # Opt in to the keyless Yahoo Finance news fallback
 
     # === Social Sentiment (US stocks only, api.adanos.org) ===
     social_sentiment_api_key: Optional[str] = None
@@ -1750,9 +1750,10 @@ class Config:
             os.getenv('SEARXNG_PUBLIC_INSTANCES_ENABLED'),
             default=False,
         )
+
         yfinance_news_enabled = parse_env_bool(
             os.getenv('YFINANCE_NEWS_ENABLED'),
-            default=True,
+            default=False,
         )
 
         # 企微消息类型与最大字节数逻辑

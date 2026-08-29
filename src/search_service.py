@@ -2427,6 +2427,9 @@ class SearchService:
     _US_STOCK_RE = re.compile(r"^[A-Za-z]{1,5}(\.[A-Za-z])?$")
     _DIRECT_NEWS_CATEGORY = "direct_company_news"
     _SECTOR_NEWS_CATEGORY = "sector_related_news"
+    # Intel dimensions that are plain "news about this symbol", and so can be
+    # served by a symbol-scoped provider. The rest are open-ended web queries.
+    SYMBOL_SCOPED_INTEL_DIMENSIONS = frozenset({"latest_news"})
     _MACRO_NEWS_CATEGORY = "macro_market_news"
     _NEWS_CATEGORY_PRIORITY = {
         _DIRECT_NEWS_CATEGORY: 0,
@@ -2559,7 +2562,7 @@ class SearchService:
         minimax_keys: Optional[List[str]] = None,
         searxng_base_urls: Optional[List[str]] = None,
         searxng_public_instances_enabled: bool = False,
-        yfinance_news_enabled: bool = True,
+        yfinance_news_enabled: bool = False,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
     ):
@@ -2575,7 +2578,7 @@ class SearchService:
             minimax_keys: MiniMax API Key 列表
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
-            yfinance_news_enabled: 是否启用 Yahoo Finance 新闻兜底源（无需 API Key）
+            yfinance_news_enabled: 是否启用 Yahoo Finance 新闻兜底源（无需 API Key，默认关闭）
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
@@ -4534,6 +4537,17 @@ class SearchService:
             error_message="事件搜索失败"
         )
     
+    def _symbol_scoped_news_provider(
+        self, *, exclude: Optional[Any] = None
+    ) -> Optional["YFinanceNewsProvider"]:
+        """Return the keyless symbol-scoped news provider, if one is enabled."""
+        for provider in self._providers:
+            if provider is exclude:
+                continue
+            if isinstance(provider, YFinanceNewsProvider) and provider.is_available:
+                return provider
+        return None
+
     def search_comprehensive_intel(
         self,
         stock_code: str,
@@ -4701,12 +4715,20 @@ class SearchService:
                 break
             
             # 选择搜索引擎（轮流使用）
+            # A symbol-scoped provider can serve the plain stock-news dimension
+            # but not the open-ended ones ("研报 目标价", "减持 处罚" ...), so it
+            # is admitted per dimension rather than for the whole path.
+            dimension_is_symbol_servable = dim["name"] in self.SYMBOL_SCOPED_INTEL_DIMENSIONS
             available_providers = [
                 p
                 for p in self._providers
                 # Duck-typed providers (tests, plugins) predate the flag, so a
                 # missing attribute keeps the previous "can be asked anything".
-                if p.is_available and getattr(p, "supports_open_ended_queries", True)
+                if p.is_available
+                and (
+                    getattr(p, "supports_open_ended_queries", True)
+                    or dimension_is_symbol_servable
+                )
             ]
             if not available_providers:
                 break
@@ -4727,7 +4749,14 @@ class SearchService:
                 request_days,
             )
 
-            if isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
+            if isinstance(provider, YFinanceNewsProvider):
+                response = provider.search(
+                    dim['query'],
+                    max_results=provider_max_results,
+                    days=request_days,
+                    stock_code=stock_code,
+                )
+            elif isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
                 response = provider.search(
                     dim['query'],
                     max_results=provider_max_results,
@@ -4740,6 +4769,29 @@ class SearchService:
                     max_results=provider_max_results,
                     days=request_days,
                 )
+
+            # Only one provider is tried per dimension, so a provider that is
+            # out of quota leaves the dimension empty. For dimensions that are
+            # simply "news about this symbol" the keyless source can still
+            # answer, so fall back to it rather than returning nothing.
+            if dimension_is_symbol_servable and not response.results:
+                fallback = self._symbol_scoped_news_provider(exclude=provider)
+                if fallback is not None:
+                    logger.info(
+                        "[情报搜索] %s: %s 无结果，回退到 %s",
+                        dim['desc'],
+                        provider.name,
+                        fallback.name,
+                    )
+                    fallback_response = fallback.search(
+                        dim['query'],
+                        max_results=provider_max_results,
+                        days=request_days,
+                        stock_code=stock_code,
+                    )
+                    if fallback_response.results:
+                        response = fallback_response
+
             if dim['strict_freshness']:
                 filtered_response = self._filter_news_response(
                     response,

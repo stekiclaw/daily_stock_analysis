@@ -144,9 +144,6 @@ class TestTavilySearchProvider(unittest.TestCase):
                     service = SearchService(
                         tavily_keys=["dummy_key"],
                         searxng_public_instances_enabled=False,
-                        # This case is about Tavily's own date handling; the
-                        # Yahoo fallback would otherwise add live results.
-                        yfinance_news_enabled=False,
                         news_max_age_days=3,
                         news_strategy_profile="short",
                     )

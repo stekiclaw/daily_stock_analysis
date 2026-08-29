@@ -169,3 +169,98 @@ def test_provider_is_marked_symbol_scoped():
     assert TavilySearchProvider.supports_open_ended_queries is True
     # It answers "news for this symbol", not "what happened in the sector".
     assert YFinanceNewsProvider.supports_open_ended_queries is False
+
+
+# --- multi-dimension intelligence path --------------------------------------
+
+
+def test_symbol_scoped_provider_serves_only_the_news_dimension():
+    """It can answer "news for NVDA" but not "研报 目标价 评级"."""
+    from src.search_service import SearchService
+
+    assert "latest_news" in SearchService.SYMBOL_SCOPED_INTEL_DIMENSIONS
+    for open_ended in ("market_analysis", "risk_check", "industry_analysis", "announcements"):
+        assert open_ended not in SearchService.SYMBOL_SCOPED_INTEL_DIMENSIONS
+
+
+def test_comprehensive_intel_uses_the_fallback_for_latest_news(fake_yf, monkeypatch):
+    from src.search_service import SearchService
+
+    fake = fake_yf({"NVDA": [_item("Fresh NVDA headline")]})
+    service = SearchService(
+        searxng_public_instances_enabled=False,
+        yfinance_news_enabled=True,
+        news_max_age_days=3,
+        news_strategy_profile="short",
+    )
+    # Only the keyless fallback is configured, mirroring the state where every
+    # metered provider is out of quota.
+    assert [p.name for p in service._providers] == ["YFinanceNews"]
+
+    responses = service.search_comprehensive_intel("NVDA", "NVIDIA", max_searches=3)
+
+    assert fake.asked == ["NVDA"]
+    titles = [r.title for resp in responses.values() for r in resp.results]
+    assert "Fresh NVDA headline" in titles
+
+
+def test_news_dimension_falls_back_when_the_chosen_provider_returns_nothing(
+    fake_yf, monkeypatch
+):
+    """One provider is tried per dimension; an exhausted one must not zero it out."""
+    from src.search_service import SearchResponse, SearchService, TavilySearchProvider
+
+    fake = fake_yf({"NVDA": [_item("Fallback headline")]})
+
+    def _empty(self, query, max_results=5, days=7, **kwargs):
+        return SearchResponse(
+            query=query,
+            results=[],
+            provider=self.name,
+            success=False,
+            error_message="API 配额已用尽",
+        )
+
+    monkeypatch.setattr(TavilySearchProvider, "search", _empty)
+
+    service = SearchService(
+        tavily_keys=["dummy"],
+        searxng_public_instances_enabled=False,
+        yfinance_news_enabled=True,
+        news_max_age_days=3,
+        news_strategy_profile="short",
+    )
+    responses = service.search_comprehensive_intel("NVDA", "NVIDIA", max_searches=3)
+
+    assert fake.asked == ["NVDA"]
+    titles = [r.title for resp in responses.values() for r in resp.results]
+    assert "Fallback headline" in titles
+
+
+def test_open_ended_dimension_does_not_fall_back_to_the_symbol_source(
+    fake_yf, monkeypatch
+):
+    from src.search_service import SearchResponse, SearchService, TavilySearchProvider
+
+    fake = fake_yf({"NVDA": [_item("Should not appear")]})
+    seen_dimensions = []
+
+    def _empty(self, query, max_results=5, days=7, **kwargs):
+        seen_dimensions.append(query)
+        return SearchResponse(query=query, results=[], provider=self.name, success=False)
+
+    monkeypatch.setattr(TavilySearchProvider, "search", _empty)
+
+    service = SearchService(
+        tavily_keys=["dummy"],
+        searxng_public_instances_enabled=False,
+        yfinance_news_enabled=True,
+        news_max_age_days=3,
+        news_strategy_profile="short",
+    )
+    # Force every dimension to be treated as open-ended.
+    monkeypatch.setattr(SearchService, "SYMBOL_SCOPED_INTEL_DIMENSIONS", frozenset())
+    service.search_comprehensive_intel("NVDA", "NVIDIA", max_searches=3)
+
+    # "研报 目标价 评级" is not something a per-symbol news feed can answer.
+    assert fake.asked == []
