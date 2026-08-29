@@ -4254,6 +4254,68 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertIn("effective_days=1", joined)
         self.assertIn("min(profile_days, NEWS_MAX_AGE_DAYS)", joined)
 
+    def test_update_warns_when_process_env_shadows_the_saved_value(self) -> None:
+        """A Docker env_file value silently reverts the save on restart."""
+        with patch.dict(
+            Config._BOOTSTRAP_PROCESS_ENV_SNAPSHOT,
+            {"GENERATION_BACKEND": "litellm"},
+            clear=False,
+        ), patch.object(Config, "_BOOTSTRAP_RUNTIME_ENV_OVERRIDES_CAPTURED", True):
+            response = self.service.update(
+                config_version=self.manager.get_config_version(),
+                items=[{"key": "GENERATION_BACKEND", "value": "codex_oauth"}],
+                reload_now=False,
+            )
+
+        self.assertTrue(response["success"])
+        joined = " | ".join(response["warnings"])
+        self.assertIn("GENERATION_BACKEND", joined)
+        self.assertIn("重启", joined)
+
+    def test_bootstrap_process_env_snapshot_is_not_refreshed_by_reloads(self) -> None:
+        """A save reloads with override=True; re-capturing then would read file values."""
+        with patch.object(Config, "_BOOTSTRAP_PROCESS_ENV_CAPTURED", False), \
+             patch.dict(Config._BOOTSTRAP_PROCESS_ENV_SNAPSHOT, {}, clear=True), \
+             patch.dict(os.environ, {"GENERATION_BACKEND": "litellm"}, clear=False):
+            Config._capture_bootstrap_runtime_env_overrides()
+            self.assertEqual(
+                Config._BOOTSTRAP_PROCESS_ENV_SNAPSHOT.get("GENERATION_BACKEND"), "litellm"
+            )
+
+            # Mimic a WebUI save: reset_instance() + a reload that pushed the
+            # persisted file value into os.environ.
+            Config.reset_instance()
+            with patch.dict(os.environ, {"GENERATION_BACKEND": "codex_oauth"}, clear=False):
+                Config._capture_bootstrap_runtime_env_overrides()
+                self.assertEqual(
+                    Config._BOOTSTRAP_PROCESS_ENV_SNAPSHOT.get("GENERATION_BACKEND"),
+                    "litellm",
+                    "snapshot must still describe the original process environment",
+                )
+                # And so the shadow check stays right instead of false-positiving.
+                self.assertFalse(
+                    Config.bootstrap_process_env_shadows("GENERATION_BACKEND", "litellm")
+                )
+                self.assertTrue(
+                    Config.bootstrap_process_env_shadows("GENERATION_BACKEND", "codex_oauth")
+                )
+
+    def test_update_does_not_warn_when_process_env_matches_the_saved_value(self) -> None:
+        with patch.dict(
+            Config._BOOTSTRAP_PROCESS_ENV_SNAPSHOT,
+            {"GENERATION_BACKEND": "codex_oauth"},
+            clear=False,
+        ), patch.object(Config, "_BOOTSTRAP_RUNTIME_ENV_OVERRIDES_CAPTURED", True):
+            response = self.service.update(
+                config_version=self.manager.get_config_version(),
+                items=[{"key": "GENERATION_BACKEND", "value": "codex_oauth"}],
+                reload_now=False,
+            )
+
+        self.assertTrue(response["success"])
+        joined = " | ".join(response["warnings"])
+        self.assertNotIn("进程环境变量", joined)
+
     def test_update_appends_max_workers_warning(self) -> None:
         response = self.service.update(
             config_version=self.manager.get_config_version(),

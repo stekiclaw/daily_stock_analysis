@@ -53,7 +53,9 @@ from src.llm.hermes import (
 from src.llm.generation_params import apply_litellm_generation_params
 from src.llm.errors import call_litellm_with_param_recovery
 from src.llm.backend_registry import (
+    CODEX_OAUTH_BACKEND_ID,
     LOCAL_CLI_GENERATION_BACKEND_IDS,
+    NON_LITELLM_GENERATION_BACKEND_IDS,
     LITELLM_BACKEND_ID,
     resolve_generation_backend_id,
     resolve_generation_fallback_backend_id,
@@ -2313,7 +2315,7 @@ class GeminiAnalyzer:
                 backend_id, _fallback_backend_id = self._resolve_generation_backend_config()
             except GenerationError:
                 backend_id = ""
-            if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+            if backend_id in NON_LITELLM_GENERATION_BACKEND_IDS:
                 logger.info(
                     "Analyzer generation backend: %s configured; LiteLLM API keys are not "
                     "required for stock analysis generation",
@@ -2480,7 +2482,7 @@ class GeminiAnalyzer:
                 backend_id = resolve_generation_backend_id(config)
             except GenerationError:
                 pass
-            if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+            if backend_id in NON_LITELLM_GENERATION_BACKEND_IDS:
                 logger.info(
                     "Analyzer LiteLLM: LITELLM_MODEL not configured; using %s generation backend",
                     backend_id,
@@ -2583,7 +2585,7 @@ class GeminiAnalyzer:
         if backend_error is not None:
             return self._can_use_generation_fallback(backend_error)
         backend_id, _fallback_backend_id = self._resolve_generation_backend_config()
-        if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+        if backend_id in NON_LITELLM_GENERATION_BACKEND_IDS:
             return True
         return self._litellm_runtime_available()
 
@@ -2621,7 +2623,7 @@ class GeminiAnalyzer:
                 mixed_error = self._get_mixed_hermes_route_error(config, model)
                 if mixed_error is not None:
                     return mixed_error
-            if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+            if backend_id in NON_LITELLM_GENERATION_BACKEND_IDS:
                 backend = self._get_generation_backend(backend_id)
                 get_config_error = getattr(backend, "get_config_error", None)
                 if callable(get_config_error):
@@ -3609,6 +3611,9 @@ class GeminiAnalyzer:
         if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
             return backend_id, backend_id
         config = self._get_runtime_config()
+        if backend_id == CODEX_OAUTH_BACKEND_ID:
+            # LITELLM_MODEL names a model this backend never calls.
+            return backend_id, str(getattr(config, "codex_oauth_model", "") or "")
         return backend_id, str(getattr(config, "litellm_model", "") or "")
 
     def generate_text_with_metadata(
