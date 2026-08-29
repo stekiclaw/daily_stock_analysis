@@ -198,6 +198,13 @@ class TestValidateStructuredLLM:
         assert error.field == "AGENT_ARCH"
         assert "single" in error.message
 
+    def test_codex_oauth_agent_backend_is_supported(self):
+        cfg = _make_config(agent_backend="codex_oauth")
+
+        issues = cfg.validate_structured()
+
+        assert not any(i.field == "AGENT_BACKEND" for i in issues)
+
     def test_unknown_agent_backend_is_structured_config_error(self):
         cfg = _make_config(agent_backend="unknown")
 

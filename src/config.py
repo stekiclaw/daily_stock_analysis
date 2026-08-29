@@ -127,7 +127,7 @@ _FALLBACK_LITELLM_MODEL_PROVIDERS = _MANAGED_LITELLM_KEY_PROVIDERS | set(SUPPORT
 }
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off"}
 PROMPT_CACHE_DIAGNOSTICS_LEVELS = {"off", "basic", "debug"}
-SUPPORTED_AGENT_BACKENDS = {"auto", "litellm", "codex_app_server"}
+SUPPORTED_AGENT_BACKENDS = {"auto", "litellm", "codex_app_server", "codex_oauth"}
 TICKFLOW_KLINE_ADJUST_VALUES = {"none", "forward", "backward", "forward_additive", "backward_additive"}
 # Fallback defaults used when ANSPIRE_API_KEYS is reused as legacy OpenAI-compatible source.
 # These are compatibility examples; actual availability should be validated by Anspire console/model entitlement.
@@ -3256,7 +3256,7 @@ class Config:
             issues.append(ConfigIssue(
                 severity="error",
                 message=(
-                    "AGENT_BACKEND 当前支持 auto、litellm、codex_app_server。"
+                    "AGENT_BACKEND 当前支持 auto、litellm、codex_app_server、codex_oauth。"
                     f"已配置的值为：{agent_backend}。"
                 ),
                 field="AGENT_BACKEND",
