@@ -175,3 +175,110 @@ class TestErrorHandling:
     def test_open_ended_queries_are_not_supported(self):
         """The intelligence layer must skip this source for free-text lookups."""
         assert FinnhubNewsProvider.supports_open_ended_queries is False
+
+
+class TestProviderIsWiredAtEveryConstructionSite:
+    """The provider must reach every SearchService, not just the factory.
+
+    SearchService is built in four places (module factory, StockAnalysisPipeline,
+    market_review_runtime, and the isolated topic-news subprocess via
+    _constructor_kwargs). Wiring only the factory left stock analysis - the
+    main path - without the source entirely, which is how the first live
+    verification came back with the provider unregistered.
+    """
+
+    @staticmethod
+    def _provider_names(service) -> list:
+        return [p.name for p in service._providers]
+
+    def test_direct_construction_registers_the_provider(self):
+        from src.search_service import SearchService
+
+        service = SearchService(finnhub_news_keys=["k"])
+        assert "FinnhubNews" in self._provider_names(service)
+
+    def test_absent_key_leaves_it_unregistered(self):
+        from src.search_service import SearchService
+
+        service = SearchService(finnhub_news_keys=[])
+        assert "FinnhubNews" not in self._provider_names(service)
+
+    def test_subprocess_kwargs_carry_both_symbol_scoped_sources(self):
+        """topic-news runs in an isolated process rebuilt from these kwargs."""
+        from src.search_service import SearchService
+
+        service = SearchService(finnhub_news_keys=["k"], yfinance_news_enabled=True)
+        kwargs = service._constructor_kwargs
+        assert kwargs["finnhub_news_keys"] == ["k"]
+        assert kwargs["yfinance_news_enabled"] is True
+        # Rebuilding from the kwargs must yield the same provider set.
+        assert "FinnhubNews" in self._provider_names(SearchService(**kwargs))
+
+    def test_pipeline_passes_the_configured_key(self):
+        import inspect
+
+        from src.core import pipeline
+
+        source = inspect.getsource(pipeline.StockAnalysisPipeline.__init__)
+        assert "finnhub_news_keys=" in source
+
+    def test_market_review_runtime_passes_the_configured_key(self):
+        import inspect
+
+        from src.core import market_review_runtime
+
+        assert "finnhub_news_keys=" in inspect.getsource(market_review_runtime)
+
+
+class TestIntelligenceLayerPassesTheSymbol:
+    """Symbol-scoped providers must receive stock_code from the intel layer.
+
+    That dispatch used to be gated on isinstance(YFinanceNewsProvider), so any
+    other symbol-scoped source got stock_code=None and could only fail. Keyed
+    on supports_open_ended_queries instead, which is the property that actually
+    determines whether a provider can use the query text.
+    """
+
+    def _service(self):
+        from src.search_service import SearchService
+
+        return SearchService(finnhub_news_keys=["k"])
+
+    def test_symbol_scoped_provider_receives_the_code(self):
+        service = self._service()
+        provider = MagicMock()
+        provider.supports_open_ended_queries = False
+        provider.name = "AnySymbolScoped"
+
+        service._search_intel_provider(
+            provider,
+            {"query": "Microsoft Corporation MSFT latest news events", "desc": "最新消息"},
+            stock_code="MSFT",
+            max_results=6,
+            request_days=3,
+        )
+
+        assert provider.search.call_args.kwargs["stock_code"] == "MSFT"
+
+    def test_web_search_provider_is_not_given_a_code(self):
+        """Open-ended engines search the query text; the kwarg is not theirs."""
+        service = self._service()
+        provider = MagicMock()
+        provider.supports_open_ended_queries = True
+        provider.name = "AnyWebSearch"
+
+        service._search_intel_provider(
+            provider,
+            {"query": "MSFT news", "desc": "最新消息"},
+            stock_code="MSFT",
+            max_results=6,
+            request_days=3,
+        )
+
+        assert "stock_code" not in provider.search.call_args.kwargs
+
+    def test_finnhub_news_declares_itself_symbol_scoped(self):
+        from src.search_service import FinnhubNewsProvider, YFinanceNewsProvider
+
+        assert FinnhubNewsProvider.supports_open_ended_queries is False
+        assert YFinanceNewsProvider.supports_open_ended_queries is False

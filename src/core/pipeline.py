@@ -310,6 +310,11 @@ class StockAnalysisPipeline:
                 searxng_base_urls=self.config.searxng_base_urls,
                 searxng_public_instances_enabled=self.config.searxng_public_instances_enabled,
                 yfinance_news_enabled=getattr(self.config, "yfinance_news_enabled", True),
+                finnhub_news_keys=(
+                    [self.config.finnhub_api_key]
+                    if getattr(self.config, "finnhub_api_key", None)
+                    else []
+                ),
                 news_max_age_days=self.config.news_max_age_days,
                 news_strategy_profile=getattr(self.config, "news_strategy_profile", "short"),
             )

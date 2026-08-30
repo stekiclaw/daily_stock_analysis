@@ -2819,6 +2819,10 @@ class SearchService:
             "minimax_keys": list(minimax_keys or []),
             "searxng_base_urls": list(searxng_base_urls or []),
             "searxng_public_instances_enabled": bool(searxng_public_instances_enabled),
+            # 两个按标的取新闻的源也要带进隔离子进程，否则 topic-news 走子进程时
+            # 会静默少掉这两个兜底源（yfinance 这项此前就漏了）。
+            "yfinance_news_enabled": bool(yfinance_news_enabled),
+            "finnhub_news_keys": list(finnhub_news_keys or []),
             "news_max_age_days": int(news_max_age_days),
             "news_strategy_profile": news_strategy_profile,
         }
@@ -4796,7 +4800,12 @@ class SearchService:
     ) -> SearchResponse:
         """Execute one intelligence query while preserving provider extensions."""
         try:
-            if isinstance(provider, YFinanceNewsProvider):
+            # Symbol-scoped sources need the code: they look news up by ticker
+            # rather than searching the query text. Keyed on the declared
+            # capability rather than a concrete class, so any such provider is
+            # handed the code - gating on isinstance(YFinanceNewsProvider)
+            # silently passed stock_code=None to every other one.
+            if not provider.supports_open_ended_queries:
                 return provider.search(
                     dimension["query"],
                     max_results=max_results,
