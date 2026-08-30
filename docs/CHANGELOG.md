@@ -52,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] `YfinanceFetcher` 不再把量比/换手率硬编码为空：复用同一次请求已拉取的 `ticker.info`（无额外请求）换算量比（优先 10 日均量，退回约 3 个月均量近似 A 股 5 日口径）与换手率（优先流通股本），此前美股/日股/韩股/台股报告的这两个字段永远是 N/A，模型无法据此判断放量/缩量。
 - [修复] 筹码分布：区分"该市场/品种结构性不支持"（美股/港股/ETF/指数）与"抓取失败"——新增 `DataFetcherManager.is_chip_distribution_unsupported_market`，pipeline 据此把前者标记为 `chip_not_supported` 元数据；`AnalysisContextBuilder` 已有的 NOT_SUPPORTED 判定分支此前从未被写入过，所有非 A 股报告的筹码数据质量分因此被误判为抓取失败（35/100）而非结构性不适用（70/100）。
 
+- [新功能] 新增 `FinnhubNews` 美股公司新闻源（`/company-news`，Finnhub 免费层可用，复用既有 `FINNHUB_API_KEY`），排在 Yahoo 兜底源之前。计费搜索源额度耗尽、自建 SearXNG 上游引擎被 CAPTCHA 拦截时，美股分析曾只剩 0-1 条新闻；该源按标的返回量高一个数量级。结果按"是否确为该标的"优先、再按时间排序——该接口约三成返回是同日通用行情通稿，纯按时间截断会把 `max_results` 预算耗在噪音上（实测前 5 条相关数 3/5 → 5/5）。
+- [修复] `YfinanceFetcher` 实时行情补齐成交额（`amount`）：此前恒为 `None`，导致"今日成交额"显示 N/A，而历史每一行都有值、无法与当日对比。改用与日线列相同的口径（`volume * price`，见 `_estimate_yfinance_amount`），两者可比；同时该字段不再计入 `missing_fields`，行情数据质量从 `partial` 回到 `ok`。
+- [改进] `FinnhubFetcher.priority` 支持 `FINNHUB_PRIORITY` 环境变量（默认 2，行为不变）。Finnhub 免费层不含 `/stock/candle`，日线恒 403 并反复触发熔断；免费层部署可设 `FINNHUB_PRIORITY=9` 将其排至美股日线链路末尾，付费层不受影响，且不影响新增的 Finnhub 新闻源。
+
 ## [3.31.0] - 2026-08-23
 
 ### 发布亮点

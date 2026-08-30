@@ -55,6 +55,25 @@ import os
 logger = logging.getLogger(__name__)
 
 
+def _estimate_yfinance_amount(
+    volume: Optional[float],
+    price: Optional[float],
+) -> Optional[float]:
+    """Estimate 成交额 as ``volume * price``, matching the daily-bar convention.
+
+    Yahoo exposes no turnover field, so this fetcher's daily path has always
+    derived the column the same way (``df['amount'] = df['volume'] *
+    df['close']``). The realtime path left it None, which meant the intraday
+    "今日成交额" cell read N/A while every historical row carried a value —
+    the model could not compare today's turnover against the series it was
+    given. Using the identical formula keeps the two comparable; it is an
+    approximation of true VWAP-based turnover in both cases.
+    """
+    if not volume or volume <= 0 or not price or price <= 0:
+        return None
+    return float(volume) * float(price)
+
+
 def _compute_yfinance_volume_signals(
     volume: Optional[float],
     ticker_info: Dict[str, Any],
@@ -940,6 +959,7 @@ class YfinanceFetcher(BaseFetcher):
             pe_ratio = _safe_float(ticker_info.get('trailingPE'))
             pb_ratio = _safe_float(ticker_info.get('priceToBook'))
             volume_ratio, turnover_rate = _compute_yfinance_volume_signals(volume, ticker_info)
+            amount = _estimate_yfinance_amount(volume, price)
 
             missing_fields = [
                 field
@@ -947,7 +967,7 @@ class YfinanceFetcher(BaseFetcher):
                     "price": price,
                     "prev_close": prev_close,
                     "volume": volume,
-                    "amount": None,
+                    "amount": amount,
                     "pe_ratio": pe_ratio,
                     "pb_ratio": pb_ratio,
                 }.items()
@@ -965,7 +985,8 @@ class YfinanceFetcher(BaseFetcher):
                 change_pct=round(change_pct, 2) if change_pct is not None else None,
                 change_amount=round(change_amount, 4) if change_amount is not None else None,
                 volume=volume,
-                amount=None,  # yfinance 不直接提供成交额
+                # 估算值，口径与日线 amount 一致（见 _estimate_yfinance_amount）
+                amount=amount,
                 volume_ratio=volume_ratio,
                 turnover_rate=turnover_rate,
                 amplitude=round(amplitude, 2) if amplitude is not None else None,

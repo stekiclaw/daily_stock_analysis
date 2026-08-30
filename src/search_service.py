@@ -2225,6 +2225,232 @@ class SearXNGSearchProvider(BaseSearchProvider):
         )
 
 
+class FinnhubNewsProvider(BaseSearchProvider):
+    """Ticker-scoped company news from Finnhub's ``/company-news`` endpoint.
+
+    Like :class:`YFinanceNewsProvider` this is a symbol lookup rather than a
+    web search, so it cannot answer open-ended intelligence queries. It earns
+    its place ahead of the Yahoo fallback on volume: a three-day window for a
+    liquid US name returns on the order of a hundred articles where Yahoo
+    returns six, which is the difference between the model reasoning over a
+    real news set and reasoning over a single headline.
+
+    Note this endpoint is on Finnhub's free tier even though ``/stock/candle``
+    (used by :class:`~data_provider.finnhub_fetcher.FinnhubFetcher` for daily
+    bars) is not - a 403 there says nothing about news access, so the two must
+    not be gated on each other.
+
+    Coverage is US-first; the endpoint accepts only plain exchange tickers, so
+    non-US symbols are declined up front rather than sent and failed.
+    """
+
+    BASE_URL = "https://finnhub.io/api/v1/company-news"
+    supports_open_ended_queries = False
+
+    def __init__(self, api_keys: List[str]) -> None:
+        super().__init__(api_keys, "FinnhubNews")
+
+    def search(
+        self,
+        query: str,
+        max_results: int = 5,
+        days: int = 7,
+        stock_code: Optional[str] = None,
+        region: Optional[str] = None,
+    ) -> SearchResponse:
+        symbol = self._resolve_symbol(stock_code)
+        if not symbol:
+            # Not a provider failure - this source does not cover this code.
+            # Returning early keeps it out of the key error accounting, which
+            # exists for real fetch failures.
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"{self._name} 不支持从 '{stock_code}' 解析出美股代码",
+            )
+        return self._execute_search(
+            query,
+            max_results=max_results,
+            days=days,
+            symbol=symbol,
+        )
+
+    @staticmethod
+    def _resolve_symbol(stock_code: Optional[str]) -> str:
+        """Return the plain US ticker this endpoint accepts, else ''."""
+        code = (stock_code or "").strip().upper()
+        if not code:
+            return ""
+        try:
+            from data_provider.us_index_mapping import is_us_stock_code
+        except Exception:  # pragma: no cover - defensive
+            return ""
+        return code if is_us_stock_code(code) else ""
+
+    # Boilerplate the intelligence layer appends to every query, plus the
+    # corporate-form suffixes shared by unrelated issuers. Matching on these
+    # would mark most of the wire feed "relevant" and defeat the ranking.
+    _GENERIC_QUERY_TERMS = frozenset({
+        "LATEST", "NEWS", "EVENTS", "ANALYST", "RATING", "TARGET", "PRICE",
+        "REPORT", "EARNINGS", "REVENUE", "PROFIT", "GROWTH", "FORECAST",
+        "INDUSTRY", "COMPETITORS", "MARKET", "SHARE", "OUTLOOK", "RISK",
+        "INSIDER", "SELLING", "LAWSUIT", "LITIGATION", "STOCK", "SHARES",
+        "INC", "CORP", "CORPORATION", "LTD", "LIMITED", "PLC", "GROUP",
+        "HOLDINGS", "COMPANY", "THE", "AND", "FOR",
+    })
+
+    @classmethod
+    def _relevance_terms(cls, query: str, symbol: str) -> List[str]:
+        """Terms that mark an article as being about *this* issuer.
+
+        ``/company-news`` is a per-symbol feed in name only: for a liquid US
+        ticker roughly a third of what it returns is general market wire that
+        merely ran on the same day. The caller's query already carries the
+        company's display name alongside the ticker, so reuse it rather than
+        making another lookup just to learn the name.
+        """
+        terms = [symbol.upper()]
+        for raw in re.findall(r"[A-Za-z][A-Za-z.&-]*", query or ""):
+            term = raw.upper().strip(".&-")
+            if len(term) < 3 or term in cls._GENERIC_QUERY_TERMS or term == symbol.upper():
+                continue
+            terms.append(term)
+        return terms
+
+    @staticmethod
+    def _mentions(text: str, terms: List[str]) -> bool:
+        for term in terms:
+            if re.search(rf"\b{re.escape(term)}\b", text):
+                return True
+        return False
+
+    @staticmethod
+    def _parse_published(raw: Any) -> Optional[datetime]:
+        """Finnhub timestamps are epoch seconds (UTC)."""
+        try:
+            ts = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if ts <= 0:
+            return None
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    def _do_search(
+        self,
+        query: str,
+        api_key: str,
+        max_results: int,
+        days: int = 7,
+        symbol: str = "",
+    ) -> SearchResponse:
+        window_days = max(1, days)
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=window_days)
+        params = {
+            "symbol": symbol,
+            # The endpoint filters on calendar dates, so it needs the window's
+            # start date; the precise cutoff is re-applied per item below.
+            "from": cutoff.strftime("%Y-%m-%d"),
+            "to": now.strftime("%Y-%m-%d"),
+            "token": api_key,
+        }
+
+        try:
+            response = requests.get(self.BASE_URL, params=params, timeout=15)
+        except requests.RequestException as exc:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"请求失败: {exc}",
+            )
+
+        if response.status_code != 200:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"HTTP {response.status_code}: {response.text[:200]}",
+            )
+
+        try:
+            payload = response.json()
+        except ValueError:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message="响应不是有效 JSON",
+            )
+        if not isinstance(payload, list):
+            # The endpoint answers quota/permission problems with an object
+            # carrying an ``error`` field rather than a non-200 status.
+            detail = ""
+            if isinstance(payload, dict):
+                detail = str(payload.get("error") or payload)[:200]
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"响应格式异常: {detail}",
+            )
+
+        terms = self._relevance_terms(query, symbol)
+        ranked: List[tuple] = []
+        seen_urls: set = set()
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            published = self._parse_published(item.get("datetime"))
+            if published is not None and published < cutoff:
+                continue
+            url = str(item.get("url") or "").strip()
+            if url:
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+            title = str(item.get("headline") or "").strip()
+            if not title:
+                continue
+            snippet = str(item.get("summary") or "").strip()
+            about_issuer = self._mentions(f"{title} {snippet}".upper(), terms)
+            ranked.append((
+                about_issuer,
+                published.isoformat() if published is not None else "",
+                SearchResult(
+                    title=title,
+                    snippet=snippet,
+                    url=url,
+                    source=str(item.get("source") or "").strip() or "Finnhub",
+                    published_date=(
+                        published.isoformat() if published is not None else None
+                    ),
+                ),
+            ))
+
+        # Issuer-specific first, then newest. The endpoint neither orders its
+        # response nor guarantees the feed is actually about the symbol, and
+        # the caller truncates to max_results - so ranking on recency alone
+        # would spend the whole budget on same-day general market wire.
+        ranked.sort(key=lambda row: (row[0], row[1]), reverse=True)
+        results = [row[2] for row in ranked]
+        return SearchResponse(
+            query=query,
+            results=results[:max_results],
+            provider=self._name,
+            success=True,
+        )
+
+
 class YFinanceNewsProvider(BaseSearchProvider):
     """Ticker-scoped headlines from Yahoo Finance.
 
@@ -2563,6 +2789,7 @@ class SearchService:
         searxng_base_urls: Optional[List[str]] = None,
         searxng_public_instances_enabled: bool = False,
         yfinance_news_enabled: bool = False,
+        finnhub_news_keys: Optional[List[str]] = None,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
     ):
@@ -2579,6 +2806,7 @@ class SearchService:
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
             yfinance_news_enabled: 是否启用 Yahoo Finance 新闻兜底源（无需 API Key，默认关闭）
+            finnhub_news_keys: Finnhub API Key 列表，用于美股公司新闻（免费层）
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
@@ -2649,6 +2877,15 @@ class SearchService:
                 logger.info("已配置 SearXNG 搜索，共 %s 个自建实例", len(searxng_base_urls))
             else:
                 logger.info("已启用 SearXNG 公共实例自动发现模式")
+
+        # 6.4 Finnhub 公司新闻（免费层可用，按标的取新闻）。
+        # 排在 Yahoo 之前：同样是符号维度的源，但单次返回量高一个数量级，
+        # 在计费源额度耗尽、SearXNG 引擎被 CAPTCHA 拦截时能撑住美股舆情面。
+        # 注意：这里用的 /company-news 属于免费层，与 FinnhubFetcher 取日线用的
+        # /stock/candle（付费）是两回事，后者 403 不代表新闻不可用。
+        if finnhub_news_keys:
+            self._providers.append(FinnhubNewsProvider(finnhub_news_keys))
+            logger.info("已启用 Finnhub 公司新闻源（美股，免费层）")
 
         # 6.5 Yahoo Finance 新闻（无 key、无配额，作为保底源）。
         # 排在最后：它只能按标的取新闻，答不了开放式检索，但在计费源额度耗尽、
@@ -5198,6 +5435,11 @@ def get_search_service() -> SearchService:
                     searxng_base_urls=config.searxng_base_urls,
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
                     yfinance_news_enabled=getattr(config, "yfinance_news_enabled", True),
+                    finnhub_news_keys=(
+                        [config.finnhub_api_key]
+                        if getattr(config, "finnhub_api_key", None)
+                        else []
+                    ),
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )

@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 from data_provider.yfinance_fetcher import (
     YfinanceFetcher,
     _compute_yfinance_volume_signals,
+    _estimate_yfinance_amount,
 )
 
 
@@ -121,3 +122,48 @@ class TestRealtimeQuoteCarriesVolumeSignals:
         assert quote is not None
         assert quote.volume_ratio is None
         assert quote.turnover_rate is None
+
+
+class TestEstimatedAmount:
+    """成交额 was None on every realtime quote while the daily bars carried a
+    value, so the prompt's 今日成交额 cell read N/A and could not be compared
+    against the historical series it was shown alongside."""
+
+    def test_uses_the_same_formula_as_the_daily_bar_column(self):
+        # daily path: df['amount'] = df['volume'] * df['close']
+        assert _estimate_yfinance_amount(1_000, 12.5) == 12_500.0
+
+    def test_missing_or_nonpositive_inputs_yield_none_not_zero(self):
+        for volume, price in ((None, 10.0), (0, 10.0), (100, None), (100, 0), (-5, 10.0)):
+            assert _estimate_yfinance_amount(volume, price) is None
+
+    @patch("yfinance.Ticker")
+    def test_realtime_quote_carries_amount_and_clears_the_missing_flag(
+        self, ticker_factory: MagicMock
+    ) -> None:
+        ticker = ticker_factory.return_value
+        ticker.fast_info = SimpleNamespace(
+            lastPrice=200.0,
+            previousClose=198.0,
+            open=199.0,
+            dayHigh=201.0,
+            dayLow=197.0,
+            lastVolume=1_000_000,
+            marketCap=None,
+        )
+        ticker.info = {
+            "shortName": "Test Co",
+            "currency": "USD",
+            "trailingPE": 20.0,
+            "priceToBook": 3.0,
+            "averageVolume10days": 1_000_000,
+            "floatShares": 100_000_000,
+        }
+
+        quote = YfinanceFetcher().get_realtime_quote("ZTST")
+
+        assert quote is not None
+        assert quote.amount == 200.0 * 1_000_000
+        # amount no longer counts as missing, so the quote is no longer partial.
+        assert quote.missing_fields is None
+        assert quote.data_quality == "ok"
