@@ -56,6 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] `YfinanceFetcher` 实时行情补齐成交额（`amount`）：此前恒为 `None`，导致"今日成交额"显示 N/A，而历史每一行都有值、无法与当日对比。改用与日线列相同的口径（`volume * price`，见 `_estimate_yfinance_amount`），两者可比；同时该字段不再计入 `missing_fields`，行情数据质量从 `partial` 回到 `ok`。
 - [改进] `FinnhubFetcher.priority` 支持 `FINNHUB_PRIORITY` 环境变量（默认 2，行为不变）。Finnhub 免费层不含 `/stock/candle`，日线恒 403 并反复触发熔断；免费层部署可设 `FINNHUB_PRIORITY=9` 将其排至美股日线链路末尾，付费层不受影响，且不影响新增的 Finnhub 新闻源。
 
+- [新功能] 新增 ETF 成分股新闻兜底源 `ETFConstituentNews`（无需 API Key，`ETF_CONSTITUENT_NEWS_ENABLED=true` 启用，默认关闭）。冷门与杠杆/反向 ETF 常年不产生自己的新闻——SOXS 在 Yahoo 上最新一条是 29 天前，对 3 天分析窗口而言基金层来源全部（正确地）返回空，报告因此没有任何舆情面。ETF 价格由成分股驱动，故回退到取前五大持仓的新闻；结果标注来源成分股，不会被误读为基金公告。仅在基金层来源（Finnhub/Yahoo）全空时触发，真实基金新闻始终优先；现金/货币基金类持仓会被过滤，因此仅持有掉期抵押品的杠杆/反向基金仍解析不出成分股。结果同样按"是否确为该成分股"优先排序——持仓的新闻流里同样混有同日通用行情稿。
+
 ## [3.31.0] - 2026-08-23
 
 ### 发布亮点

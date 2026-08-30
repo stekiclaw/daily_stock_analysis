@@ -2225,6 +2225,43 @@ class SearXNGSearchProvider(BaseSearchProvider):
         )
 
 
+# Boilerplate the intelligence layer appends to every query, plus corporate-form
+# suffixes shared by unrelated issuers. Matching on these would mark most of a
+# wire feed "relevant" and defeat the ranking.
+_GENERIC_ISSUER_TERMS = frozenset({
+    "LATEST", "NEWS", "EVENTS", "ANALYST", "RATING", "TARGET", "PRICE",
+    "REPORT", "EARNINGS", "REVENUE", "PROFIT", "GROWTH", "FORECAST",
+    "INDUSTRY", "COMPETITORS", "MARKET", "SHARE", "OUTLOOK", "RISK",
+    "INSIDER", "SELLING", "LAWSUIT", "LITIGATION", "STOCK", "SHARES",
+    "INC", "CORP", "CORPORATION", "LTD", "LIMITED", "PLC", "GROUP",
+    "HOLDINGS", "COMPANY", "THE", "AND", "FOR", "ADR", "CLASS",
+})
+
+
+def _issuer_relevance_terms(text: str, symbol: str) -> List[str]:
+    """Terms that mark an article as being about *this* issuer.
+
+    Symbol-scoped news feeds are per-issuer in name only - a meaningful share
+    of what they return is same-day general market wire that merely ran
+    alongside. Callers pass whatever names the issuer (an analysis query
+    carrying the company's display name, or an ETF holding's name).
+    """
+    terms = [symbol.upper()] if symbol else []
+    for raw in re.findall(r"[A-Za-z][A-Za-z.&-]*", text or ""):
+        term = raw.upper().strip(".&-")
+        if len(term) < 3 or term in _GENERIC_ISSUER_TERMS or term in terms:
+            continue
+        terms.append(term)
+    return terms
+
+
+def _mentions_issuer(text: str, terms: List[str]) -> bool:
+    for term in terms:
+        if re.search(rf"\b{re.escape(term)}\b", text):
+            return True
+    return False
+
+
 class FinnhubNewsProvider(BaseSearchProvider):
     """Ticker-scoped company news from Finnhub's ``/company-news`` endpoint.
 
@@ -2289,42 +2326,10 @@ class FinnhubNewsProvider(BaseSearchProvider):
             return ""
         return code if is_us_stock_code(code) else ""
 
-    # Boilerplate the intelligence layer appends to every query, plus the
-    # corporate-form suffixes shared by unrelated issuers. Matching on these
-    # would mark most of the wire feed "relevant" and defeat the ranking.
-    _GENERIC_QUERY_TERMS = frozenset({
-        "LATEST", "NEWS", "EVENTS", "ANALYST", "RATING", "TARGET", "PRICE",
-        "REPORT", "EARNINGS", "REVENUE", "PROFIT", "GROWTH", "FORECAST",
-        "INDUSTRY", "COMPETITORS", "MARKET", "SHARE", "OUTLOOK", "RISK",
-        "INSIDER", "SELLING", "LAWSUIT", "LITIGATION", "STOCK", "SHARES",
-        "INC", "CORP", "CORPORATION", "LTD", "LIMITED", "PLC", "GROUP",
-        "HOLDINGS", "COMPANY", "THE", "AND", "FOR",
-    })
-
-    @classmethod
-    def _relevance_terms(cls, query: str, symbol: str) -> List[str]:
-        """Terms that mark an article as being about *this* issuer.
-
-        ``/company-news`` is a per-symbol feed in name only: for a liquid US
-        ticker roughly a third of what it returns is general market wire that
-        merely ran on the same day. The caller's query already carries the
-        company's display name alongside the ticker, so reuse it rather than
-        making another lookup just to learn the name.
-        """
-        terms = [symbol.upper()]
-        for raw in re.findall(r"[A-Za-z][A-Za-z.&-]*", query or ""):
-            term = raw.upper().strip(".&-")
-            if len(term) < 3 or term in cls._GENERIC_QUERY_TERMS or term == symbol.upper():
-                continue
-            terms.append(term)
-        return terms
-
-    @staticmethod
-    def _mentions(text: str, terms: List[str]) -> bool:
-        for term in terms:
-            if re.search(rf"\b{re.escape(term)}\b", text):
-                return True
-        return False
+    # Shared with ETFConstituentNewsProvider: both consume per-issuer feeds
+    # that carry unrelated same-day wire.
+    _relevance_terms = staticmethod(_issuer_relevance_terms)
+    _mentions = staticmethod(_mentions_issuer)
 
     @staticmethod
     def _parse_published(raw: Any) -> Optional[datetime]:
@@ -2615,6 +2620,195 @@ class YFinanceNewsProvider(BaseSearchProvider):
         )
 
 
+class ETFConstituentNewsProvider(BaseSearchProvider):
+    """News for an ETF's largest holdings, used when the fund itself has none.
+
+    A thinly-covered or leveraged ETF rarely generates news under its own
+    ticker - SOXS's most recent Yahoo headline was 29 days old against a
+    3-day analysis window, so every fund-level source correctly returned
+    nothing. But an ETF's price is driven by its constituents, so their news
+    is the news that actually explains the move; a human analyst looking at a
+    semiconductor ETF reads semiconductor company news.
+
+    Placed last in the chain, so it only fires when the fund-level sources
+    (Finnhub/Yahoo) came back empty - real fund news is always preferred.
+    Needs no API key.
+
+    Results are attributed to the holding they came from, so downstream
+    relevance scoring sees them for what they are: background/driver news for
+    the fund, not announcements by the fund.
+    """
+
+    supports_open_ended_queries = False
+    # Cost bound: one holdings lookup plus one news lookup per constituent.
+    MAX_CONSTITUENTS = 5
+    # Cash-collateral and money-market positions carry no equity news. Leveraged
+    # and inverse funds hold swaps, so these are often *all* they report, which
+    # is why such a fund legitimately yields no constituent news at all.
+    _CASH_HOLDING_TERMS = (
+        "CASH", "TREASURY", "MONEY MARKET", "GOVT OBLIG", "GOVERNMENT OBLIG",
+        "LIQUIDITY", "REPO", "DEPOSIT",
+    )
+
+    def __init__(self) -> None:
+        # No credential to rotate; the base class only needs a non-empty pool.
+        super().__init__(["etf-constituents"], "ETFConstituentNews")
+
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    @classmethod
+    def _is_cash_like(cls, symbol: str, name: str) -> bool:
+        upper_name = (name or "").upper()
+        if any(term in upper_name for term in cls._CASH_HOLDING_TERMS):
+            return True
+        # US mutual-fund/money-market tickers are five letters ending in XX
+        # (DIRXX, FGXXX); listed equities never take that form.
+        ticker = (symbol or "").strip().upper()
+        return len(ticker) == 5 and ticker.isalpha() and ticker.endswith("XX")
+
+    def _resolve_constituents(self, stock_code: str) -> List[tuple]:
+        """Return ``[(symbol, name), ...]`` for the fund's top equity holdings."""
+        code = (stock_code or "").strip().upper()
+        if not code:
+            return []
+        try:
+            import yfinance as yf
+
+            holdings = yf.Ticker(code).funds_data.top_holdings
+        except Exception as exc:
+            # Not an ETF, or Yahoo has no fund data for it. Either way this
+            # source does not apply - it is not a fetch failure.
+            logger.debug("[%s] %s 无法获取持仓: %s", self._name, code, exc)
+            return []
+        if holdings is None or getattr(holdings, "empty", True):
+            return []
+
+        resolved: List[tuple] = []
+        for symbol, row in holdings.iterrows():
+            try:
+                name = str(row.get("Name") or "")
+            except Exception:
+                name = ""
+            ticker = str(symbol).strip()
+            if not ticker or self._is_cash_like(ticker, name):
+                continue
+            resolved.append((ticker, name))
+            if len(resolved) >= self.MAX_CONSTITUENTS:
+                break
+        return resolved
+
+    def search(
+        self,
+        query: str,
+        max_results: int = 5,
+        days: int = 7,
+        stock_code: Optional[str] = None,
+        region: Optional[str] = None,
+    ) -> SearchResponse:
+        constituents = self._resolve_constituents(stock_code or "")
+        if not constituents:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"{self._name} 无法解析 '{stock_code}' 的成分股（非 ETF 或仅持有现金类资产）",
+            )
+        return self._execute_search(
+            query,
+            max_results=max_results,
+            days=days,
+            constituents=constituents,
+        )
+
+    def _do_search(
+        self,
+        query: str,
+        api_key: str,
+        max_results: int,
+        days: int = 7,
+        constituents: Optional[List[tuple]] = None,
+    ) -> SearchResponse:
+        constituents = list(constituents or [])
+        try:
+            import yfinance as yf
+        except ImportError:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message="yfinance 未安装",
+            )
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, days))
+        ranked: List[tuple] = []
+        seen_urls: set = set()
+
+        for ticker, holding_name in constituents:
+            try:
+                items = yf.Ticker(ticker).news or []
+            except Exception as exc:
+                logger.debug("[%s] 成分股 %s 拉取新闻失败: %s", self._name, ticker, exc)
+                continue
+
+            # A holding's Yahoo feed carries unrelated market wire too, so rank
+            # articles that actually concern the holding above ones that merely
+            # appeared in its feed - otherwise max_results is spent on noise.
+            terms = _issuer_relevance_terms(holding_name, ticker)
+
+            for item in items:
+                content = item.get("content") if isinstance(item, dict) else None
+                if not isinstance(content, dict):
+                    continue
+                published = YFinanceNewsProvider._parse_published(content.get("pubDate"))
+                if published is not None and published < cutoff:
+                    continue
+                url = ""
+                for key in ("canonicalUrl", "clickThroughUrl"):
+                    candidate = content.get(key)
+                    if isinstance(candidate, dict) and candidate.get("url"):
+                        url = str(candidate["url"])
+                        break
+                if url:
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                title = str(content.get("title") or "").strip()
+                if not title:
+                    continue
+                label = holding_name.strip() or ticker
+                snippet = str(content.get("summary") or "").strip()
+                about_holding = _mentions_issuer(f"{title} {snippet}".upper(), terms)
+                ranked.append((
+                    about_holding,
+                    published.isoformat() if published is not None else "",
+                    SearchResult(
+                        title=title,
+                        snippet=snippet,
+                        url=url,
+                        # Attribution names the holding, so a reader (and the
+                        # model) can tell this is constituent news rather than
+                        # something the fund itself announced.
+                        source=f"成分股 {ticker}（{label}）",
+                        published_date=(
+                            published.isoformat() if published is not None else None
+                        ),
+                    ),
+                ))
+
+        # Holding-specific first, then newest.
+        ranked.sort(key=lambda row: (row[0], row[1]), reverse=True)
+        return SearchResponse(
+            query=query,
+            results=[row[2] for row in ranked][:max_results],
+            provider=self._name,
+            success=True,
+        )
+
+
 class SearchService:
     """
     搜索服务
@@ -2790,6 +2984,7 @@ class SearchService:
         searxng_public_instances_enabled: bool = False,
         yfinance_news_enabled: bool = False,
         finnhub_news_keys: Optional[List[str]] = None,
+        etf_constituent_news_enabled: bool = False,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
     ):
@@ -2807,6 +3002,7 @@ class SearchService:
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
             yfinance_news_enabled: 是否启用 Yahoo Finance 新闻兜底源（无需 API Key，默认关闭）
             finnhub_news_keys: Finnhub API Key 列表，用于美股公司新闻（免费层）
+            etf_constituent_news_enabled: ETF 自身无新闻时是否回退到成分股新闻（无需 API Key）
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
@@ -2823,6 +3019,7 @@ class SearchService:
             # 会静默少掉这两个兜底源（yfinance 这项此前就漏了）。
             "yfinance_news_enabled": bool(yfinance_news_enabled),
             "finnhub_news_keys": list(finnhub_news_keys or []),
+            "etf_constituent_news_enabled": bool(etf_constituent_news_enabled),
             "news_max_age_days": int(news_max_age_days),
             "news_strategy_profile": news_strategy_profile,
         }
@@ -2897,6 +3094,13 @@ class SearchService:
         if yfinance_news_enabled:
             self._providers.append(YFinanceNewsProvider())
             logger.info("已启用 Yahoo Finance 新闻兜底源（无需 API Key）")
+
+        # 6.6 ETF 成分股新闻（无 key）。排在所有基金层来源之后：只有当 ETF 自身
+        # 确实没有新闻时才回退到成分股——冷门/杠杆 ETF 常年没有自己的新闻，但
+        # 驱动其价格的成分股有。
+        if etf_constituent_news_enabled:
+            self._providers.append(ETFConstituentNewsProvider())
+            logger.info("已启用 ETF 成分股新闻回退源（无需 API Key）")
 
         # 7. Anspire Search（实时智能搜索优化）
         if anspire_keys:
@@ -5448,6 +5652,9 @@ def get_search_service() -> SearchService:
                         [config.finnhub_api_key]
                         if getattr(config, "finnhub_api_key", None)
                         else []
+                    ),
+                    etf_constituent_news_enabled=getattr(
+                        config, "etf_constituent_news_enabled", False
                     ),
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),

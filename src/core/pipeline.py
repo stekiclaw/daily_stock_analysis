@@ -315,6 +315,9 @@ class StockAnalysisPipeline:
                     if getattr(self.config, "finnhub_api_key", None)
                     else []
                 ),
+                etf_constituent_news_enabled=getattr(
+                    self.config, "etf_constituent_news_enabled", False
+                ),
                 news_max_age_days=self.config.news_max_age_days,
                 news_strategy_profile=getattr(self.config, "news_strategy_profile", "short"),
             )

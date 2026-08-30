@@ -111,6 +111,9 @@ def build_market_review_runtime(
                 if getattr(config, "finnhub_api_key", None)
                 else []
             ),
+            etf_constituent_news_enabled=getattr(
+                config, "etf_constituent_news_enabled", False
+            ),
             news_max_age_days=getattr(config, "news_max_age_days", 3),
             news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
         )
