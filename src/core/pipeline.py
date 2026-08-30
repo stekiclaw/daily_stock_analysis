@@ -1036,7 +1036,8 @@ class StockAnalysisPipeline:
             chip_data: 筹码分布数据
             trend_result: 趋势分析结果
             stock_name: 股票名称
-            market_phase_context: 已构建的市场阶段上下文，用于标记盘中 partial bar
+            market_phase_context: 已构建的市场阶段上下文，用于标记盘中 partial bar，
+                并在 is_trading_day 明确为 False 时跳过实时 today 覆盖
             
         Returns:
             增强后的上下文
@@ -1113,7 +1114,19 @@ class StockAnalysisPipeline:
 
         # Issue #234：盘中分析使用实时 OHLC 与趋势 MA 覆盖 today。
         # 防护条件：trend_result.ma5 > 0 表示 MA 计算已成功且数据量充足。
-        if realtime_quote and trend_result and trend_result.ma5 > 0:
+        # 非交易日不覆盖，与 _augment_historical_with_realtime 的交易日护栏保持一致：
+        # 此时实时报价只是上一交易日的收盘快照，覆盖会把完整官方日线换成缺字段的估算
+        # bar，并让 technical 数据块被标成 partial/estimated。phase 未知时保持失败开放。
+        is_non_trading_day = (
+            isinstance(market_phase_context, dict)
+            and market_phase_context.get("is_trading_day") is False
+        )
+        if (
+            realtime_quote
+            and trend_result
+            and trend_result.ma5 > 0
+            and not is_non_trading_day
+        ):
             price = getattr(realtime_quote, 'price', None)
             if price is not None and price > 0:
                 yesterday_close = None

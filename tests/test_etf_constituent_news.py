@@ -63,6 +63,110 @@ class TestCashHoldingFilter:
         assert ETFConstituentNewsProvider._is_cash_like("XRXX", "") is False  # 4 letters
         assert ETFConstituentNewsProvider._is_cash_like("LUMN", "Lumen") is False
 
+    def test_t_bill_collateral_funds_are_excluded(self):
+        """0DTE covered-call ETFs park collateral in a T-bill ETF.
+
+        XDTE/QDTE/RDTE report exactly two holdings - "Roundhill Weekly T-Bill
+        ETF" (5-7%) and a government money fund - and MSTU reports "The
+        Laddered T-Bill ETF". WEEK/TLDR are four-letter tickers, so the
+        five-letter XX rule cannot see them and only the name identifies them.
+        """
+        cases = [
+            ("WEEK", "Roundhill Weekly T-Bill ETF"),
+            ("TLDR", "The Laddered T-Bill ETF"),
+            ("XBIL", "US Treasury 12 Month Bill ETF"),
+        ]
+        for sym, name in cases:
+            assert ETFConstituentNewsProvider._is_cash_like(sym, name) is True
+
+    def test_money_funds_without_the_word_market_are_excluded(self):
+        """Real Yahoo names say "Money" without "Market", or abbreviate it."""
+        cases = [
+            ("IUGXY", "Invesco Premier US Government Money Inst"),
+            ("MGMXY", "JPMorgan US Government MMkt IM"),
+            ("ABCD", "Acme Govt Money Portfolio"),
+        ]
+        for sym, name in cases:
+            # Deliberately non-XX tickers: the name alone must be enough.
+            assert not (len(sym) == 5 and sym.endswith("XX"))
+            assert ETFConstituentNewsProvider._is_cash_like(sym, name) is True
+
+    def test_money_market_etf_share_classes_are_excluded(self):
+        """Money-market *ETFs* have ordinary 4-letter tickers, not XX ones."""
+        for sym, name in (("IQMM", "ProShares GENIUS Money Market ETF"),
+                          ("SBIL", "Simplify Government Money Market ETF")):
+            assert ETFConstituentNewsProvider._is_cash_like(sym, name) is True
+
+    @pytest.mark.parametrize(
+        "symbol,name",
+        [
+            # A false positive silently drops a real constituent's news, which
+            # is worse than the wasted lookup a false negative costs. These are
+            # real listed issuers whose names brush against cash vocabulary.
+            ("ML", "MoneyLion Inc"),
+            ("MNY", "MoneyHero Group Ltd"),
+            ("3994.T", "Money Forward Inc"),
+            ("MONY.L", "Moneysupermarket.com Group PLC"),
+            ("BILL", "BILL Holdings Inc"),
+            ("BILI", "Bilibili Inc ADR"),
+            ("NTRS", "Northern Trust Corp"),
+            ("TRST", "TrustCo Bancorp NY"),
+            ("DLR", "Digital Realty Trust Inc"),
+            ("BXMT", "Blackstone Mortgage Trust Inc Class A"),
+            ("LADR", "Ladder Capital Corp Class A"),
+            ("DEA", "Easterly Government Properties Inc"),
+            ("BXSL", "Blackstone Secured Lending Fund Ordinary Shares"),
+            ("TXN", "Texas Instruments Inc"),
+            ("MKTX", "MarketAxess Holdings Inc"),
+            ("GOVX", "GeoVax Labs Inc"),
+            ("RGEN", "Repligen Corp"),
+            ("STT", "State Street Corp"),
+            ("XYZ", "Block Inc Class A"),
+            ("TBBK", "The Bancorp Inc"),
+            # Real issuer whose *ticker* is CASH; terms match names, not tickers.
+            ("CASH", "Pathward Financial Inc"),
+        ],
+    )
+    def test_operating_companies_are_never_treated_as_cash(self, symbol, name):
+        assert ETFConstituentNewsProvider._is_cash_like(symbol, name) is False
+
+    @pytest.mark.parametrize(
+        "symbol,name",
+        [
+            # Live holdings that plain substring matching wrongly dropped:
+            # "CASH" inside FirstCash, "DEPOSIT" inside Depository.
+            ("FCFS", "FirstCash Holdings Inc"),
+            ("LNW", "Light & Wonder Inc Chess Depository Interest"),
+            # Yahoo spells some ADR holdings out in full; "Depositary" must not
+            # match the DEPOSIT term either.
+            ("TSM", "Taiwan Semiconductor Manufacturing Co Ltd "
+                    "American Depositary Receipt"),
+            ("BABA", "Alibaba Group Holding Ltd American Depositary Shares"),
+            # "REPO" must not match Repligen/Repsol/Repossession-style names.
+            ("RGEN", "Repligen Corp"),
+            ("REPYY", "Repsol SA ADR"),
+        ],
+    )
+    def test_cash_words_only_match_on_word_boundaries(self, symbol, name):
+        """A false positive silently drops a real constituent's news.
+
+        That is strictly worse than the wasted lookup a false negative costs,
+        so the cash vocabulary is anchored to whole words.
+        """
+        assert ETFConstituentNewsProvider._is_cash_like(symbol, name) is False
+
+    def test_word_boundaries_do_not_weaken_the_cash_terms(self):
+        """The boundary rule must not let genuine cash positions through."""
+        cases = [
+            ("ABCD", "BNY Dreyfus Govt Cash Mgmt Instl"),
+            ("EFGH", "BlackRock Cash Funds Treasury SL Agency"),
+            ("IJKL", "Deposits with Broker for Short Positions"),
+            ("MNOP", "Morgan Stanley Institutional Liquidity Treasury"),
+            ("QRST", "First American Treasury Obligs X"),
+        ]
+        for sym, name in cases:
+            assert ETFConstituentNewsProvider._is_cash_like(sym, name) is True
+
 
 class TestConstituentResolution:
     def _provider_with_holdings(self, frame):
@@ -86,6 +190,21 @@ class TestConstituentResolution:
         provider, ticker = self._provider_with_holdings(frame)
         with patch("yfinance.Ticker", return_value=ticker):
             assert provider._resolve_constituents("SOXS") == []
+
+    def test_t_bill_collateral_only_fund_resolves_to_nothing(self):
+        """XDTE/QDTE/RDTE hold only a T-bill ETF plus a government money fund.
+
+        Before the T-BILL term, WEEK survived the filter and the provider spent
+        a news lookup on a T-bill ETF's Yahoo feed, attributing whatever wire
+        it carried to the fund as constituent driver news.
+        """
+        frame = _holdings([
+            ("WEEK", "Roundhill Weekly T-Bill ETF"),
+            ("FGXXX", "First American Government Obligs X"),
+        ])
+        provider, ticker = self._provider_with_holdings(frame)
+        with patch("yfinance.Ticker", return_value=ticker):
+            assert provider._resolve_constituents("XDTE") == []
 
     def test_resolution_is_capped(self):
         rows = [(f"T{i}", f"Company {i}") for i in range(20)]

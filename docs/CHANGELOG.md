@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [改进] 多维度情报搜索的搜索源链路改为按目标条数推进：单个搜索源返回的结果不足目标条数（每维度 3 条）时继续向下一个搜索源补充，并按 URL 归一化去重后合并；达到目标即停止，不会遍历全部搜索源。合并结果的来源标记为参与贡献的搜索源组合（如 `FinnhubNews+ETFConstituentNews`）
 - [修复] 美股日线路由现按各数据源当前优先级排序，单项 `*_PRIORITY` 配置（如 `YFINANCE_PRIORITY=0`）对美股即时生效；指数固定首选与 Longbridge preferred 语义保持不变
 
 - [新功能] 支持通过 `main.py --stocks` 一次性分析已登记板块指数，自动使用指数适用的数据与分析能力，并保持报告、历史和决策信号兼容。
@@ -57,6 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] `FinnhubFetcher.priority` 支持 `FINNHUB_PRIORITY` 环境变量（默认 2，行为不变）。Finnhub 免费层不含 `/stock/candle`，日线恒 403 并反复触发熔断；免费层部署可设 `FINNHUB_PRIORITY=9` 将其排至美股日线链路末尾，付费层不受影响，且不影响新增的 Finnhub 新闻源。
 
 - [新功能] 新增 ETF 成分股新闻兜底源 `ETFConstituentNews`（无需 API Key，`ETF_CONSTITUENT_NEWS_ENABLED=true` 启用，默认关闭）。冷门与杠杆/反向 ETF 常年不产生自己的新闻——SOXS 在 Yahoo 上最新一条是 29 天前，对 3 天分析窗口而言基金层来源全部（正确地）返回空，报告因此没有任何舆情面。ETF 价格由成分股驱动，故回退到取前五大持仓的新闻；结果标注来源成分股，不会被误读为基金公告。仅在基金层来源（Finnhub/Yahoo）全空时触发，真实基金新闻始终优先；现金/货币基金类持仓会被过滤，因此仅持有掉期抵押品的杠杆/反向基金仍解析不出成分股。结果同样按"是否确为该成分股"优先排序——持仓的新闻流里同样混有同日通用行情稿。
+- [修复] 非交易日（`market_phase_context.is_trading_day=false`）不再用实时报价覆盖 `today` 日线：休市时实时报价只是上一交易日的收盘快照，覆盖会把完整官方日线换成缺 `amount`、日期标成非交易日的估算 bar，并让 `analysis_context_pack_overview` 的 `technical` 数据块恒为 `partial`（75 分）+ `intraday_realtime_overlay` 告警，同时让 Prompt 的「上一完整交易日行情」分支永不生效。护栏与 `_augment_historical_with_realtime` 已有的交易日判断保持一致；阶段未知时保持失败开放，盘前/盘后等交易日内场景行为不变。
+- [修复] `ETFConstituentNews` 的现金类持仓过滤改为按单词边界匹配，并补齐 T-Bill / 货币基金命名变体。原先的子串匹配会把真实成分股当成现金持仓丢掉——`CASH` 命中 FirstCash Holdings（IWO 持仓）、`DEPOSIT` 命中 Light & Wonder 的 “Chess Depository Interest”（BETZ 持仓），也会命中任何写全称的 “American Depositary Receipt”；误杀会静默抹掉该成分股的新闻，代价高于漏判。同时新增 `T-BILL`、`MONEY MKT`/`MMKT`、`GOVERNMENT MONEY`/`GOVT MONEY`：XDTE/QDTE/RDTE 只持有 `WEEK`（Roundhill Weekly T-Bill ETF，占比 5%-7%）和一只政府货币基金，`WEEK` 是四字母代码、名称也不含原有关键词，此前会被当作成分股去抓新闻，并把 T-Bill ETF 新闻流里的通用行情稿标注成该基金的成分股驱动新闻；现在这类基金正确地解析不出成分股。改动已对 338 只基金的 1052 条真实持仓，以及 MoneyLion / MoneyHero / BILL Holdings / Northern Trust / Texas Instruments / Easterly Government Properties 等实体名称验证无误伤。
 
 ## [3.31.0] - 2026-08-23
 

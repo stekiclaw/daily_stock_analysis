@@ -2645,9 +2645,42 @@ class ETFConstituentNewsProvider(BaseSearchProvider):
     # Cash-collateral and money-market positions carry no equity news. Leveraged
     # and inverse funds hold swaps, so these are often *all* they report, which
     # is why such a fund legitimately yields no constituent news at all.
-    _CASH_HOLDING_TERMS = (
-        "CASH", "TREASURY", "MONEY MARKET", "GOVT OBLIG", "GOVERNMENT OBLIG",
-        "LIQUIDITY", "REPO", "DEPOSIT",
+    #
+    # Matched on word boundaries, because a false positive is worse than the
+    # false negative it prevents: dropping a real holding silently removes the
+    # very signal this provider exists to supply, while keeping one only costs
+    # a news lookup that comes back empty. Plain substring matching got this
+    # wrong on live data - "CASH" matched FirstCash Holdings (held by IWO) and
+    # "DEPOSIT" matched Light & Wonder's "Chess Depository Interest" (BETZ),
+    # and it would match any "American Depositary Receipt" name too.
+    #
+    # For the same reason every term is a money-fund phrase rather than a bare
+    # word: "MONEY" alone matches MoneyLion/MoneyHero/Money Forward, "BILL"
+    # matches BILL Holdings, "TRUST" matches Northern Trust and Digital Realty
+    # Trust, "GOV" matches Easterly Government Properties, and "INST" matches
+    # Texas Instruments.
+    _CASH_HOLDING_PATTERN = re.compile(
+        r"\b(?:"
+        r"CASH"
+        r"|TREASURY|TREASURIES"
+        # Money funds, including names that say "Money" without "Market"
+        # ("Invesco Premier US Government Money Inst") or abbreviate it
+        # ("JPMorgan US Government MMkt IM"). Those two are caught today only
+        # by the five-letter XX ticker below; a money-market *ETF* share class
+        # (IQMM, SBIL) has no such ticker to fall back on.
+        r"|MONEY\s+(?:MARKET|MKT)|MMKT"
+        r"|(?:GOVT|GOVERNMENT)\s+MONEY"
+        # "Government Obligs X", "Treasury Obligations"
+        r"|(?:GOVT|GOVERNMENT|TREASURY)\s+OBLIG\w*"
+        r"|LIQUIDITY"
+        r"|REPOS?"
+        r"|DEPOSITS?"
+        # T-bill funds are the collateral sleeve of 0DTE covered-call ETFs:
+        # XDTE/QDTE/RDTE report only "Roundhill Weekly T-Bill ETF" (5-7%) plus
+        # a government money fund, and MSTU reports "The Laddered T-Bill ETF".
+        # WEEK/TLDR are four-letter tickers, so only the name identifies them.
+        r"|T-BILLS?"
+        r")\b"
     )
 
     def __init__(self) -> None:
@@ -2660,8 +2693,7 @@ class ETFConstituentNewsProvider(BaseSearchProvider):
 
     @classmethod
     def _is_cash_like(cls, symbol: str, name: str) -> bool:
-        upper_name = (name or "").upper()
-        if any(term in upper_name for term in cls._CASH_HOLDING_TERMS):
+        if cls._CASH_HOLDING_PATTERN.search((name or "").upper()):
             return True
         # US mutual-fund/money-market tickers are five letters ending in XX
         # (DIRXX, FGXXX); listed equities never take that form.
@@ -2850,6 +2882,9 @@ class SearchService:
     # Intel dimensions that are plain "news about this symbol", and so can be
     # served by a symbol-scoped provider. The rest are open-ended web queries.
     SYMBOL_SCOPED_INTEL_DIMENSIONS = frozenset({"latest_news"})
+    # A dimension filled from several providers reports a combined label; keep
+    # it inside the persisted NewsIntel.provider column width (String(32)).
+    MERGED_PROVIDER_LABEL_MAX_LEN = 32
     _MACRO_NEWS_CATEGORY = "macro_market_news"
     _NEWS_CATEGORY_PRIORITY = {
         _DIRECT_NEWS_CATEGORY: 0,
@@ -4434,6 +4469,48 @@ class SearchService:
         )
 
     @staticmethod
+    def _intel_result_identity(item: SearchResult) -> str:
+        """Cross-provider identity for one news item.
+
+        Different providers surface the same article under cosmetically
+        different URLs (scheme, "www.", trailing slash, "#fragment"), so the URL
+        is normalized before it is used as the merge key. Items without a URL
+        fall back to title+source, mirroring the soft dedup key used when the
+        same items are persisted (see ``Database.save_news_intel``).
+        """
+        url = (item.url or "").split("#", 1)[0].strip().lower()
+        for scheme in ("https://", "http://"):
+            if url.startswith(scheme):
+                url = url[len(scheme):]
+                break
+        if url.startswith("www."):
+            url = url[4:]
+        url = url.rstrip("/")
+        if url:
+            return f"url:{url}"
+        title = (item.title or "").strip().lower()
+        source = (item.source or "").strip().lower()
+        return f"title:{title}|{source}"
+
+    @classmethod
+    def _merged_provider_label(cls, provider_names: List[str]) -> str:
+        """Label a response that was filled from more than one provider.
+
+        Kept within ``NewsIntel.provider`` (String(32)) so a merged label still
+        persists losslessly; longer chains degrade to "<first>+<n more>".
+        """
+        unique: List[str] = []
+        for name in provider_names:
+            if name and name not in unique:
+                unique.append(name)
+        if not unique:
+            return "None"
+        label = "+".join(unique)
+        if len(label) <= cls.MERGED_PROVIDER_LABEL_MAX_LEN:
+            return label
+        return f"{unique[0]}+{len(unique) - 1}"[: cls.MERGED_PROVIDER_LABEL_MAX_LEN]
+
+    @staticmethod
     def _elapsed_ms(started_at: float) -> int:
         return max(0, int((time.monotonic() - started_at) * 1000))
 
@@ -5299,6 +5376,16 @@ class SearchService:
             )
             filtered_response = response
 
+            # The chain walks providers in preference order and keeps going
+            # while the accumulated (already filtered/ranked/admitted) count is
+            # still short of the target. Stopping at the first non-empty
+            # response used to settle for a single weak item and never reach the
+            # next source, which for some symbols holds the relevant news.
+            merged_results: List[SearchResult] = []
+            merged_identities: set = set()
+            contributions: List[SearchResponse] = []
+            contributing_providers: List[str] = []
+
             for attempt, provider in enumerate(providers_to_try):
                 if attempt == 0:
                     logger.info(
@@ -5306,6 +5393,14 @@ class SearchService:
                         dim['desc'],
                         provider.name,
                         request_days,
+                    )
+                elif merged_results:
+                    logger.info(
+                        "[情报搜索] %s: 前序渠道仅累计 %s/%s 条，继续向 %s 补充",
+                        dim['desc'],
+                        len(merged_results),
+                        target_per_dimension,
+                        provider.name,
                     )
                 else:
                     logger.info(
@@ -5331,15 +5426,29 @@ class SearchService:
                     max_results=provider_max_results,
                     target_results=target_per_dimension,
                 )
+
+                added = 0
+                for item in filtered_response.results or []:
+                    identity = self._intel_result_identity(item)
+                    if identity in merged_identities:
+                        continue
+                    merged_identities.add(identity)
+                    merged_results.append(item)
+                    added += 1
+                if added:
+                    contributions.append(filtered_response)
+                    contributing_providers.append(provider.name)
+
                 logger.info(
-                    "[情报搜索] %s/%s: 原始=%s条, 过滤后=%s条",
+                    "[情报搜索] %s/%s: 原始=%s条, 过滤后=%s条, 新增=%s条, 累计=%s/%s",
                     dim['desc'],
                     provider.name,
                     len(response.results),
                     len(filtered_response.results),
+                    added,
+                    len(merged_results),
+                    target_per_dimension,
                 )
-                if filtered_response.results:
-                    break
                 if not response.success:
                     logger.warning(
                         "[情报搜索] %s/%s: 搜索失败 - %s",
@@ -5347,8 +5456,36 @@ class SearchService:
                         provider.name,
                         response.error_message,
                     )
+                if len(merged_results) >= target_per_dimension:
+                    break
 
-            results[dim['name']] = filtered_response
+            if not contributions:
+                # No provider yielded anything: keep the last attempt verbatim so
+                # the failure/error accounting downstream is unchanged.
+                dimension_response = filtered_response
+            elif len(contributions) == 1:
+                # Single source: hand back the very object the old chain would
+                # have returned, metadata included.
+                dimension_response = contributions[0]
+            else:
+                merged_success = any(item.success for item in contributions)
+                dimension_response = SearchResponse(
+                    query=dim["query"],
+                    results=merged_results[:target_per_dimension],
+                    provider=self._merged_provider_label(contributing_providers),
+                    success=merged_success,
+                    error_message=None if merged_success else filtered_response.error_message,
+                    search_time=sum(item.search_time for item in contributions),
+                )
+                logger.info(
+                    "[情报搜索] %s: 合并 %s 个渠道后共 %s 条（目标 %s）",
+                    dim['desc'],
+                    len(contributing_providers),
+                    len(dimension_response.results),
+                    target_per_dimension,
+                )
+
+            results[dim['name']] = dimension_response
             search_count += 1
             
             # 短暂延迟避免请求过快

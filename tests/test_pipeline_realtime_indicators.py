@@ -422,6 +422,192 @@ class TestEnhanceContextRealtimeOverride(unittest.TestCase):
         self.assertEqual(enhanced["today"]["close"], 15.0)
         self.assertEqual(enhanced["today"]["ma5"], 14.8)
 
+    def _non_trading_day_case(self):
+        """构造一个「非交易日 + 有实时报价 + 有趋势结果」的输入。"""
+        last_session = date.today() - timedelta(days=2)
+        context = {
+            "code": "600519",
+            "date": last_session.isoformat(),
+            "today": {
+                "code": "600519",
+                "date": last_session.isoformat(),
+                "open": 14.9,
+                "high": 15.2,
+                "low": 14.7,
+                "close": 15.0,
+                "volume": 1200000,
+                "amount": 18000000,
+                "pct_chg": 3.45,
+                "data_source": "AkshareFetcher",
+            },
+            "yesterday": {"close": 14.5, "volume": 1000000},
+        }
+        quote = _make_realtime_quote(price=15.72, volume=2000000, amount=None)
+        trend = TrendAnalysisResult(
+            code="600519",
+            trend_status=TrendStatus.BULL,
+            ma5=15.5,
+            ma10=15.2,
+            ma20=14.9,
+        )
+        return context, quote, trend
+
+    @patch("src.core.pipeline.get_market_now")
+    @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
+    def test_today_not_overridden_when_phase_is_non_trading_day(
+        self, _mock_market, mock_now
+    ) -> None:
+        """非交易日不做实时覆盖：保留完整官方日线，不打 estimated 标记。"""
+        today = date.today()
+        mock_now.return_value = datetime(
+            today.year, today.month, today.day, 10, 0, tzinfo=timezone.utc
+        )
+        context, quote, trend = self._non_trading_day_case()
+        last_session_date = context["today"]["date"]
+
+        enhanced = self.pipeline._enhance_context(
+            context,
+            quote,
+            None,
+            trend,
+            "贵州茅台",
+            market_phase_context={
+                "market": "cn",
+                "phase": "non_trading",
+                "is_trading_day": False,
+                "is_market_open_now": False,
+                "is_partial_bar": False,
+            },
+        )
+
+        self.assertEqual(enhanced["today"]["close"], 15.0)
+        self.assertEqual(enhanced["today"]["open"], 14.9)
+        self.assertEqual(enhanced["today"]["amount"], 18000000)
+        self.assertEqual(enhanced["today"]["date"], last_session_date)
+        self.assertEqual(enhanced["today"]["data_source"], "AkshareFetcher")
+        self.assertEqual(enhanced["date"], last_session_date)
+        self.assertNotIn("is_estimated", enhanced["today"])
+        self.assertNotIn("estimated_fields", enhanced["today"])
+        self.assertNotIn("is_partial_bar", enhanced["today"])
+        self.assertNotIn("realtime_source", enhanced["today"])
+        # 实时行情本身仍然透传，只是不改写日线 bar。
+        self.assertEqual(enhanced["realtime"]["price"], 15.72)
+
+    @patch("src.core.pipeline.get_market_now")
+    @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
+    def test_non_trading_day_context_keeps_technical_block_available(
+        self, _mock_market, mock_now
+    ) -> None:
+        """非交易日的 enhanced_context 不应把 technical 数据块降级为 partial。"""
+        from src.schemas.analysis_context_pack import ContextFieldStatus
+        from src.services.analysis_context_builder import (
+            AnalysisContextBuilder,
+            PipelineAnalysisArtifacts,
+        )
+
+        today = date.today()
+        mock_now.return_value = datetime(
+            today.year, today.month, today.day, 10, 0, tzinfo=timezone.utc
+        )
+        context, quote, trend = self._non_trading_day_case()
+        phase = {
+            "market": "cn",
+            "phase": "non_trading",
+            "is_trading_day": False,
+            "is_market_open_now": False,
+            "is_partial_bar": False,
+        }
+
+        enhanced = self.pipeline._enhance_context(
+            context, quote, None, trend, "贵州茅台", market_phase_context=phase
+        )
+        pack = AnalysisContextBuilder.build(
+            PipelineAnalysisArtifacts(
+                code="600519",
+                stock_name="贵州茅台",
+                market="cn",
+                phase=phase,
+                base_context=context,
+                enhanced_context=enhanced,
+                realtime_quote=quote,
+                trend_result=trend,
+                chip_data=None,
+                fundamental_context=None,
+                news_context=None,
+                news_result_count=None,
+                metadata={},
+            )
+        )
+        technical = pack.blocks["technical"]
+
+        self.assertEqual(technical.status, ContextFieldStatus.AVAILABLE)
+        self.assertEqual(technical.warnings, [])
+        self.assertNotIn("intraday_overlay", technical.items)
+        self.assertNotIn("intraday_realtime_overlay", pack.data_quality.warnings)
+        self.assertEqual(pack.data_quality.block_scores["technical"], 100)
+
+    @patch("src.core.pipeline.get_market_now")
+    @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
+    def test_today_still_overridden_after_close_on_a_trading_day(
+        self, _mock_market, mock_now
+    ) -> None:
+        """收盘后仍是交易日：保留覆盖，让当日盘后快照进入 today。"""
+        today = date.today()
+        mock_now.return_value = datetime(
+            today.year, today.month, today.day, 10, 0, tzinfo=timezone.utc
+        )
+        context, quote, trend = self._non_trading_day_case()
+
+        enhanced = self.pipeline._enhance_context(
+            context,
+            quote,
+            None,
+            trend,
+            "贵州茅台",
+            market_phase_context={
+                "market": "cn",
+                "phase": "postmarket",
+                "is_trading_day": True,
+                "is_market_open_now": False,
+                "is_partial_bar": False,
+            },
+        )
+
+        self.assertEqual(enhanced["today"]["close"], 15.72)
+        self.assertEqual(enhanced["today"]["data_source"], "realtime:tencent")
+        self.assertTrue(enhanced["today"]["is_estimated"])
+        self.assertIs(enhanced["today"]["is_partial_bar"], False)
+
+    @patch("src.core.pipeline.get_market_now")
+    @patch("src.core.pipeline.get_market_for_stock", return_value="cn")
+    def test_today_overridden_when_trading_day_flag_is_unknown(
+        self, _mock_market, mock_now
+    ) -> None:
+        """phase 未知（is_trading_day=None）时保持失败开放，仍执行覆盖。"""
+        today = date.today()
+        mock_now.return_value = datetime(
+            today.year, today.month, today.day, 10, 0, tzinfo=timezone.utc
+        )
+        context, quote, trend = self._non_trading_day_case()
+
+        enhanced = self.pipeline._enhance_context(
+            context,
+            quote,
+            None,
+            trend,
+            "贵州茅台",
+            market_phase_context={
+                "market": "cn",
+                "phase": "unknown",
+                "is_trading_day": None,
+                "is_market_open_now": None,
+                "is_partial_bar": None,
+            },
+        )
+
+        self.assertEqual(enhanced["today"]["close"], 15.72)
+        self.assertEqual(enhanced["today"]["data_source"], "realtime:tencent")
+
 
 if __name__ == "__main__":
     unittest.main()
