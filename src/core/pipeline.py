@@ -88,6 +88,7 @@ from src.services.run_diagnostics import (
     record_llm_run,
     record_llm_run_started,
     record_notification_run,
+    record_provider_run,
     reset_run_diagnostic_context,
     sanitize_diagnostic_text,
 )
@@ -415,9 +416,25 @@ class StockAnalysisPipeline:
             )
 
             # 断点续传检查：如果最新可复用交易日的数据已存在，则跳过
+            resume_check_start = time.time()
             if not force_refresh and self.db.has_today_data(code, target_date):
                 logger.info(
                     f"{stock_name}({code}) {target_date} 数据已存在，跳过获取（断点续传）"
+                )
+                # 断点续传命中本地存储：不请求外部数据源，但仍要记录一次成功的
+                # 数据来源，否则运行诊断会把“数据其实已具备”误报成“未记录诊断信息”。
+                record_provider_run(
+                    data_type="daily_data",
+                    provider="LocalStorage",
+                    operation="resume_local_daily_data",
+                    success=True,
+                    latency_ms=int((time.time() - resume_check_start) * 1000),
+                    cache_hit=True,
+                    data_date=(
+                        target_date.isoformat()
+                        if isinstance(target_date, date)
+                        else None
+                    ),
                 )
                 return True, None
 

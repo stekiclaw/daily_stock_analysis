@@ -60,6 +60,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 新增 ETF 成分股新闻兜底源 `ETFConstituentNews`（无需 API Key，`ETF_CONSTITUENT_NEWS_ENABLED=true` 启用，默认关闭）。冷门与杠杆/反向 ETF 常年不产生自己的新闻——SOXS 在 Yahoo 上最新一条是 29 天前，对 3 天分析窗口而言基金层来源全部（正确地）返回空，报告因此没有任何舆情面。ETF 价格由成分股驱动，故回退到取前五大持仓的新闻；结果标注来源成分股，不会被误读为基金公告。仅在基金层来源（Finnhub/Yahoo）全空时触发，真实基金新闻始终优先；现金/货币基金类持仓会被过滤，因此仅持有掉期抵押品的杠杆/反向基金仍解析不出成分股。结果同样按"是否确为该成分股"优先排序——持仓的新闻流里同样混有同日通用行情稿。
 - [修复] 非交易日（`market_phase_context.is_trading_day=false`）不再用实时报价覆盖 `today` 日线：休市时实时报价只是上一交易日的收盘快照，覆盖会把完整官方日线换成缺 `amount`、日期标成非交易日的估算 bar，并让 `analysis_context_pack_overview` 的 `technical` 数据块恒为 `partial`（75 分）+ `intraday_realtime_overlay` 告警，同时让 Prompt 的「上一完整交易日行情」分支永不生效。护栏与 `_augment_historical_with_realtime` 已有的交易日判断保持一致；阶段未知时保持失败开放，盘前/盘后等交易日内场景行为不变。
 - [修复] `ETFConstituentNews` 的现金类持仓过滤改为按单词边界匹配，并补齐 T-Bill / 货币基金命名变体。原先的子串匹配会把真实成分股当成现金持仓丢掉——`CASH` 命中 FirstCash Holdings（IWO 持仓）、`DEPOSIT` 命中 Light & Wonder 的 “Chess Depository Interest”（BETZ 持仓），也会命中任何写全称的 “American Depositary Receipt”；误杀会静默抹掉该成分股的新闻，代价高于漏判。同时新增 `T-BILL`、`MONEY MKT`/`MMKT`、`GOVERNMENT MONEY`/`GOVT MONEY`：XDTE/QDTE/RDTE 只持有 `WEEK`（Roundhill Weekly T-Bill ETF，占比 5%-7%）和一只政府货币基金，`WEEK` 是四字母代码、名称也不含原有关键词，此前会被当作成分股去抓新闻，并把 T-Bill ETF 新闻流里的通用行情稿标注成该基金的成分股驱动新闻；现在这类基金正确地解析不出成分股。改动已对 338 只基金的 1052 条真实持仓，以及 MoneyLion / MoneyHero / BILL Holdings / Northern Trust / Texas Instruments / Easterly Government Properties 等实体名称验证无误伤。
+- [修复] 运行诊断不再把“补充字段”的数据源尝试当成行情降级：`_provider_component` 现在只把**首个成功之前**的真实失败视为 fallback，并按首个成功的数据源归因。主源成功后 `DataFetcherManager._supplement_quote` 仍会调用 Finnhub/AlphaVantage 等补齐 pe_ratio 等缺失字段，这些尝试与其失败此前会让每次美股分析都显示“实时行情降级”，且来源被错报成最后一个补充源；真正的 fallback（首个成功之前有数据源失败）仍报告 `degraded`，并在 `details.failed_providers` 中列出失败源。
+- [修复] `error_type=unavailable`（数据源未配置或请求时不可用）不再计入数据源失败：未配置长桥/富途/Tushare 的部署不应被永久标记为降级；这类被跳过的数据源改为记入 `details.skipped_providers`，全部数据源都不可用时仍报告 `failed`。
+- [修复] 断点续传命中本地存储时补记一条 `daily_data` provider run（`provider=LocalStorage`、`cache_hit=true`、附 `data_date`），运行诊断由“日线数据未记录诊断信息（unknown）”改为“日线数据来自本地存储缓存（数据日期 …），本次未请求外部数据源（ok）”；`ProviderRun` 新增可选字段 `data_date`，旧诊断记录缺失该字段时保持兼容。
+- [测试] 以 MSFT（补充源成功/失败）与 NBIS（真实 fallback）两条真实历史记录的 provider run 形态，补充运行诊断降级判定与本地缓存日线诊断的回归覆盖。
+
 
 ## [3.31.0] - 2026-08-23
 

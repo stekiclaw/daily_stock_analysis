@@ -25,6 +25,27 @@ GET /api/v1/history/{record_id}/diagnostics
 
 `record_id` 支持历史记录主键 ID 或 `query_id`，返回诊断摘要与 `copy_text`。
 
+## 数据源组件状态判定（fallback vs 补充）
+
+`realtime_quote` / `daily_data` 组件的状态由该 `data_type` 的 provider run 序列推导，规则如下：
+
+- provider run 按完成顺序追加（`record_provider_run_started` 只发实时流事件，不进入 `provider_runs`），因此列表顺序即真实尝试顺序。
+- 取**首个成功**的 run 作为数据来源（`details.provider`、`details.record_count`）。
+- 只有出现在**首个成功之前**的真实失败才判定为 fallback（`degraded`），并在 `details.failed_providers` 中列出。
+  首个成功之后的失败属于补充字段（`DataFetcherManager._supplement_quote` 会在主源成功后继续调用其他数据源补齐 `pe_ratio`、`volume_ratio` 等缺失字段），不影响本次数据来源与质量，不判定为降级。
+- `error_type=unavailable`（数据源未配置 / 请求时不可用）表示该数据源根本没有发起请求，不计入失败，记入 `details.skipped_providers`；未配置长桥 / 富途 / Tushare 的部署不会因此被永久标记为降级。
+- 没有任何成功的 run 时仍判定为 `failed`（包括全部数据源都是 `unavailable` 的情况）。
+
+## 本地存储（断点续传）日线诊断
+
+断点续传命中本地存储时，pipeline 不再请求外部数据源，但会补记一条 `daily_data` provider run：
+
+- `provider=LocalStorage`、`operation=resume_local_daily_data`、`success=true`、`cache_hit=true`
+- `data_date`：本次可复用交易日（`ProviderRun` 新增的可选字段，旧记录缺失时保持兼容）
+
+对应组件输出 `ok`，文案为「日线数据来自本地存储缓存（数据日期 …），本次未请求外部数据源」，替代此前的 `unknown - 日线数据未记录诊断信息`。
+该 run 与 `analysis_context_pack_overview.daily_bars` 的交叉校验（`_reconcile_daily_provider_with_analysis_input`）保持不变：输入块不可用时仍会降级并给出输入块原因。
+
 ## 复制排障信息
 
 `copy_text` 是面向 issue/排障的纯文本，包含：

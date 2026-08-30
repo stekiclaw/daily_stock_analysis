@@ -156,6 +156,7 @@ class ProviderRun:
     cache_hit: Optional[bool] = None
     stale_seconds: Optional[int] = None
     record_count: Optional[int] = None
+    data_date: Optional[str] = None
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
@@ -173,6 +174,7 @@ class ProviderRun:
             "cache_hit": self.cache_hit,
             "stale_seconds": self.stale_seconds,
             "record_count": self.record_count,
+            "data_date": self.data_date,
             "created_at": self.created_at,
         }
         return {key: value for key, value in payload.items() if value is not None}
@@ -879,6 +881,7 @@ def record_provider_run(
     cache_hit: Optional[bool] = None,
     stale_seconds: Optional[int] = None,
     record_count: Optional[int] = None,
+    data_date: Optional[str] = None,
 ) -> None:
     """Append a provider attempt to the active context without affecting callers."""
     context = get_current_diagnostic_context()
@@ -901,6 +904,7 @@ def record_provider_run(
                 cache_hit=cache_hit,
                 stale_seconds=stale_seconds,
                 record_count=record_count,
+                data_date=data_date,
             )
         )
     except Exception as exc:  # pragma: no cover - defensive fail-open guard
@@ -1054,6 +1058,8 @@ _ANALYSIS_INPUT_STATUS_MESSAGES = {
     "fetch_failed": "输入块显示抓取失败",
     "not_supported": "输入块标记为不支持",
 }
+# 数据源“未配置/请求时不可用”，属于跳过而非失败，见 `_is_skipped_provider_run`。
+_SKIPPED_PROVIDER_ERROR_TYPES = {"unavailable"}
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
@@ -1158,6 +1164,32 @@ def _reconcile_daily_provider_with_analysis_input(
     )
 
 
+def _is_skipped_provider_run(run: Dict[str, Any]) -> bool:
+    """未配置/未启用的数据源：被跳过，而不是“失败”。
+
+    `data_provider` 在数据源缺少凭据、未安装依赖或请求时不可用时，会记录
+    `error_type="unavailable"` 的尝试。这类数据源根本没有发起请求，把它算成
+    失败会让“没有配置长桥/富途/Tushare”的部署永久显示降级。
+    """
+    if run.get("success") is not False:
+        return False
+    return str(run.get("error_type") or "").strip().lower() in _SKIPPED_PROVIDER_ERROR_TYPES
+
+
+def _is_real_provider_failure(run: Dict[str, Any]) -> bool:
+    """真实失败：数据源确实被调用过并且没有拿到可用数据。"""
+    return run.get("success") is False and not _is_skipped_provider_run(run)
+
+
+def _provider_names(runs: List[Dict[str, Any]]) -> List[str]:
+    names: List[str] = []
+    for run in runs:
+        name = str(run.get("provider") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def _provider_component(
     *,
     key: str,
@@ -1172,29 +1204,63 @@ def _provider_component(
     if not runs:
         return _component(key, label, "unknown", f"{label}未记录诊断信息")
 
-    successes = [run for run in runs if run.get("success") is True]
-    failures = [run for run in runs if run.get("success") is False]
+    # provider_runs 按完成顺序追加（`record_provider_run_started` 只发实时事件，
+    # 不进入该列表），因此列表下标即真实尝试顺序。
+    first_success_index = next(
+        (index for index, run in enumerate(runs) if run.get("success") is True),
+        None,
+    )
     last_run = runs[-1]
-    if successes:
-        success_run = successes[-1]
+    if first_success_index is not None:
+        success_run = runs[first_success_index]
         provider = success_run.get("provider") or "unknown"
-        record_count = success_run.get("record_count")
+        # 只有“首个成功之前”的真实失败才是 fallback（降级）；首个成功之后的尝试
+        # 是 `_supplement_quote` 之类的字段补充，失败不影响本次数据来源与质量。
+        preceding_failures = [
+            run for run in runs[:first_success_index] if _is_real_provider_failure(run)
+        ]
+        skipped_providers = _provider_names(
+            [run for run in runs if _is_skipped_provider_run(run)]
+        )
+        cache_hit = success_run.get("cache_hit") is True
+        data_date = success_run.get("data_date")
         details = {
             "provider": provider,
             "attempts": len(runs),
-            "record_count": record_count,
+            "record_count": success_run.get("record_count"),
             "fallback_to": next(
-                (run.get("fallback_to") for run in failures if run.get("fallback_to")),
+                (
+                    run.get("fallback_to")
+                    for run in preceding_failures
+                    if run.get("fallback_to")
+                ),
                 None,
             ),
+            "cache_hit": True if cache_hit else None,
+            "data_date": data_date,
+            "skipped_providers": skipped_providers or None,
         }
-        details = {key: value for key, value in details.items() if value is not None}
-        if failures:
+        if preceding_failures:
+            details["failed_providers"] = _provider_names(preceding_failures)
+            details = {
+                key_: value for key_, value in details.items() if value is not None
+            }
             return _component(
                 key,
                 label,
                 "degraded",
                 f"{label}{provider} 成功，前置数据源失败后已继续",
+                details,
+            )
+
+        details = {key_: value for key_, value in details.items() if value is not None}
+        if cache_hit:
+            date_text = f"（数据日期 {data_date}）" if data_date else ""
+            return _component(
+                key,
+                label,
+                "ok",
+                f"{label}来自本地存储缓存{date_text}，本次未请求外部数据源",
                 details,
             )
         return _component(
