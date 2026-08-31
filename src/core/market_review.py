@@ -12,6 +12,7 @@
 
 import logging
 import inspect
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -837,6 +838,7 @@ def _persist_market_review_history(
             region=region,
             report_language=report_language,
             diagnostic_snapshot=diagnostic_snapshot,
+            market_review_payload=market_review_payload,
         )
 
         db = DatabaseManager.get_instance()
@@ -878,22 +880,123 @@ def _persist_market_review_history(
         return 0
 
 
+def _finite_market_change(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, str):
+            value = value.strip().removesuffix("%").strip()
+            if not value:
+                return None
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric_value if math.isfinite(numeric_value) else None
+
+
+def _is_volatility_index_payload(index: Dict[str, Any]) -> bool:
+    code = str(index.get("code") or "").strip().upper().lstrip("^")
+    name = str(index.get("name") or "").strip().upper()
+    return (
+        code == "VIX"
+        or "VOLATILITY" in name
+        or "波动率" in name
+        or "恐慌指数" in name
+    )
+
+
+def _payload_index_direction_available(payload: Dict[str, Any]) -> Optional[bool]:
+    """Infer whether a structured payload contains a finite equity-index move."""
+    indices = payload.get("indices")
+    if not isinstance(indices, list):
+        return None
+
+    for index in indices:
+        if not isinstance(index, dict) or _is_volatility_index_payload(index):
+            continue
+        if _finite_market_change(index.get("change_pct")) is not None:
+            return True
+    # An explicit list with no finite equity move (including VIX-only) is evidence
+    # that the market-direction anchor was unavailable, not proof of availability.
+    return False
+
+
+def _market_review_payload_quality(
+    market_review_payload: Optional[Dict[str, Any]],
+) -> tuple[str, list[str], list[str]]:
+    """Derive context quality from the core market-direction evidence.
+
+    ``Market Light.data_quality=partial`` is normal for markets such as the US
+    where breadth/limit statistics are structurally unsupported. It must not lower
+    the whole context pack when the equity-index direction itself is available.
+    Prefer the explicit index dimension, then inspect structured index rows for
+    markets that do not emit Market Light, and use the legacy quality label only
+    when neither source carries direction evidence.
+    """
+    if not isinstance(market_review_payload, dict):
+        return "available", [], []
+
+    markets = market_review_payload.get("markets")
+    payloads = (
+        [item for item in markets.values() if isinstance(item, dict)]
+        if isinstance(markets, dict)
+        else [market_review_payload]
+    )
+    quality_values: list[str] = []
+    direction_states: list[bool] = []
+    for payload in payloads:
+        light = payload.get("market_light")
+        quality = ""
+        index_available: Optional[bool] = None
+        if isinstance(light, dict):
+            quality = str(light.get("data_quality") or "").strip().lower()
+            if quality:
+                quality_values.append(quality)
+            dimensions = light.get("dimensions")
+            index_dimension = (
+                dimensions.get("index")
+                if isinstance(dimensions, dict)
+                else None
+            )
+            if isinstance(index_dimension, dict):
+                available_value = index_dimension.get("available")
+                if isinstance(available_value, bool):
+                    index_available = available_value
+
+        if index_available is None:
+            index_available = _payload_index_direction_available(payload)
+        if index_available is None and quality:
+            if quality == "unavailable":
+                index_available = False
+            elif quality == "ok":
+                index_available = True
+        if index_available is not None:
+            direction_states.append(index_available)
+
+    if any(state is False for state in direction_states):
+        return "partial", ["market_direction_data_unavailable"], quality_values
+    return "available", [], quality_values
+
+
 def _build_market_review_context_overview(
     *,
     region: str,
     report_language: str,
     diagnostic_snapshot: Optional[Dict[str, Any]],
+    market_review_payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build a low-sensitivity overview block for market-review run-flow rendering."""
-    warnings: list[str] = []
+    status, warnings, market_light_quality = _market_review_payload_quality(
+        market_review_payload
+    )
     counts = {
-        "available": 1,
+        "available": 1 if status == "available" else 0,
         "missing": 0,
         "not_supported": 0,
         "fallback": 0,
         "stale": 0,
         "estimated": 0,
-        "partial": 0,
+        "partial": 1 if status == "partial" else 0,
         "fetch_failed": 0,
     }
     metadata: Dict[str, Any] = {
@@ -901,6 +1004,8 @@ def _build_market_review_context_overview(
         "scope": "market_review",
         "report_type": MARKET_REVIEW_REPORT_TYPE,
     }
+    if market_light_quality:
+        metadata["market_light_data_quality"] = market_light_quality
     if isinstance(diagnostic_snapshot, dict):
         metadata["trigger_source"] = diagnostic_snapshot.get("trigger_source") or metadata["trigger_source"]
         metadata["scope"] = diagnostic_snapshot.get("scope") or metadata["scope"]
@@ -922,7 +1027,7 @@ def _build_market_review_context_overview(
             {
                 "key": MARKET_REVIEW_REPORT_TYPE,
                 "label": label,
-                "status": "available",
+                "status": status,
                 "source": MARKET_REVIEW_REPORT_TYPE,
                 "warnings": warnings,
                 "missing_reasons": [],
@@ -932,11 +1037,11 @@ def _build_market_review_context_overview(
         "warnings": warnings,
         "metadata": metadata,
         "data_quality": {
-            "level": "good",
-            "overall_score": 100,
-            "available": 1,
+            "level": "good" if status == "available" else "usable",
+            "overall_score": 100 if status == "available" else 75,
+            "available": counts["available"],
             "total": 1,
-            "missing": 0,
+            "missing": counts["missing"],
         },
     }
 

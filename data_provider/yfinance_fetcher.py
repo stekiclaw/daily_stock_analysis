@@ -74,6 +74,27 @@ def _estimate_yfinance_amount(
     return float(volume) * float(price)
 
 
+def _resolve_yfinance_pb_ratio(ticker_info: Dict[str, Any]) -> Optional[float]:
+    """Return Yahoo P/B only when its price and book-value currencies align.
+
+    Yahoo can expose an ADR price in the quote currency while retaining per-share
+    book value in the issuer's financial currency. For example, TSM currently
+    reports ``currency=USD`` and ``financialCurrency=TWD``; accepting its raw
+    ``priceToBook`` mixes those units (and also obscures the ADR ratio). There is
+    no reliable conversion context in the realtime payload, so the truthful result
+    is missing rather than a fabricated or threshold-filtered ratio.
+
+    When Yahoo does not disclose the financial currency, preserve the provider's
+    existing value instead of guessing that a mismatch exists.
+    """
+    pb_ratio = _safe_float(ticker_info.get("priceToBook"))
+    quote_currency = str(ticker_info.get("currency") or "").strip().upper()
+    financial_currency = str(ticker_info.get("financialCurrency") or "").strip().upper()
+    if quote_currency and financial_currency and quote_currency != financial_currency:
+        return None
+    return pb_ratio
+
+
 def _compute_yfinance_volume_signals(
     volume: Optional[float],
     ticker_info: Dict[str, Any],
@@ -396,6 +417,12 @@ class YfinanceFetcher(BaseFetcher):
         low = float(today_row['Low'])
         # 振幅 = (最高 - 最低) / 昨收 * 100
         amplitude = ((high - low) / prev_close * 100) if prev_close else 0
+        latest_index = hist.index[-1]
+        data_date = (
+            latest_index.date().isoformat()
+            if hasattr(latest_index, "date")
+            else str(latest_index)[:10]
+        )
         return {
             'code': return_code,
             'name': name,
@@ -407,8 +434,12 @@ class YfinanceFetcher(BaseFetcher):
             'low': low,
             'prev_close': prev_close,
             'volume': float(today_row['Volume']),
-            'amount': 0.0,  # Yahoo Finance 不提供准确成交额
+            # Yahoo Finance does not provide dependable index turnover.  Missing
+            # data must remain null rather than being rendered as a real zero.
+            'amount': None,
             'amplitude': amplitude,
+            'data_date': data_date,
+            'source': 'yfinance',
         }
 
     def get_main_indices(self, region: str = "cn") -> Optional[List[Dict[str, Any]]]:
@@ -826,7 +857,7 @@ class YfinanceFetcher(BaseFetcher):
             quote = UnifiedRealtimeQuote(
                 code=user_code,
                 name=index_name or user_code,
-                source=RealtimeSource.FALLBACK,
+                source=RealtimeSource.YFINANCE,
                 market="us",
                 currency=str(ticker_info.get("currency") or "").upper() or None,
                 data_quality="partial" if missing_fields else "ok",
@@ -957,7 +988,7 @@ class YfinanceFetcher(BaseFetcher):
 
             # 复用上方已获取的 ticker_info，无额外请求
             pe_ratio = _safe_float(ticker_info.get('trailingPE'))
-            pb_ratio = _safe_float(ticker_info.get('priceToBook'))
+            pb_ratio = _resolve_yfinance_pb_ratio(ticker_info)
             volume_ratio, turnover_rate = _compute_yfinance_volume_signals(volume, ticker_info)
             amount = _estimate_yfinance_amount(volume, price)
 
@@ -976,7 +1007,7 @@ class YfinanceFetcher(BaseFetcher):
             quote = UnifiedRealtimeQuote(
                 code=symbol,
                 name=name,
-                source=RealtimeSource.FALLBACK,
+                source=RealtimeSource.YFINANCE,
                 market=suffix_market or ("hk" if _is_hk_market(stock_code) else "us" if is_us_symbol else None),
                 currency=str(ticker_info.get("currency") or "").upper() or None,
                 data_quality="partial" if missing_fields else "ok",

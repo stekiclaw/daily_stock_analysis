@@ -68,7 +68,10 @@ class TestFetchYfTickerData(unittest.TestCase):
         self.assertIn('low', result)
         self.assertIn('volume', result)
         self.assertIn('amount', result)
+        self.assertIsNone(result['amount'])
         self.assertIn('amplitude', result)
+        self.assertEqual(result['data_date'], '2025-02-17')
+        self.assertEqual(result['source'], 'yfinance')
 
     def test_returns_none_when_history_empty(self):
         """history 为空时应返回 None"""

@@ -266,6 +266,7 @@ class SearchResponse:
     success: bool = True
     error_message: Optional[str] = None
     search_time: float = 0.0  # 搜索耗时（秒）
+    not_applicable: bool = False  # provider 对当前标的结构性不适用，不是请求失败
     
     def to_context(self, max_results: int = 5) -> str:
         """将搜索结果转换为可用于 AI 分析的上下文"""
@@ -2262,6 +2263,31 @@ def _mentions_issuer(text: str, terms: List[str]) -> bool:
     return False
 
 
+# Verified against Finnhub's raw UTF-8 JSON on 2026-08-31: some upstream
+# summaries already contain UTF-8 punctuation bytes decoded as Latin-1 code
+# points (for example ``10â\x80\x9312%``).  Fix only this explicit punctuation
+# whitelist; do not round-trip arbitrary Unicode text, which could corrupt valid
+# company names and non-English reporting.
+_FINNHUB_MOJIBAKE_REPLACEMENTS = {
+    "â\x80\x93": "–",
+    "â\x80\x94": "—",
+    "â\x80\x98": "‘",
+    "â\x80\x99": "’",
+    "â\x80\x9c": "“",
+    "â\x80\x9d": "”",
+    "â\x80\xa6": "…",
+    "Â\xa0": " ",
+}
+
+
+def _normalize_finnhub_text(value: Any) -> str:
+    text = str(value or "").strip()
+    for corrupted, repaired in _FINNHUB_MOJIBAKE_REPLACEMENTS.items():
+        if corrupted in text:
+            text = text.replace(corrupted, repaired)
+    return text
+
+
 class FinnhubNewsProvider(BaseSearchProvider):
     """Ticker-scoped company news from Finnhub's ``/company-news`` endpoint.
 
@@ -2306,6 +2332,7 @@ class FinnhubNewsProvider(BaseSearchProvider):
                 provider=self._name,
                 success=False,
                 error_message=f"{self._name} 不支持从 '{stock_code}' 解析出美股代码",
+                not_applicable=True,
             )
         return self._execute_search(
             query,
@@ -2386,6 +2413,10 @@ class FinnhubNewsProvider(BaseSearchProvider):
             )
 
         try:
+            # Finnhub JSON is UTF-8.  Do not let requests fall back to a legacy
+            # text encoding when the server omits/misstates charset, otherwise a
+            # real en dash becomes mojibake such as ``â`` in model evidence.
+            response.encoding = "utf-8"
             payload = response.json()
         except ValueError:
             return SearchResponse(
@@ -2393,7 +2424,7 @@ class FinnhubNewsProvider(BaseSearchProvider):
                 results=[],
                 provider=self._name,
                 success=False,
-                error_message="响应不是有效 JSON",
+                error_message="响应不是有效 UTF-8 JSON",
             )
         if not isinstance(payload, list):
             # The endpoint answers quota/permission problems with an object
@@ -2423,10 +2454,10 @@ class FinnhubNewsProvider(BaseSearchProvider):
                 if url in seen_urls:
                     continue
                 seen_urls.add(url)
-            title = str(item.get("headline") or "").strip()
+            title = _normalize_finnhub_text(item.get("headline"))
             if not title:
                 continue
-            snippet = str(item.get("summary") or "").strip()
+            snippet = _normalize_finnhub_text(item.get("summary"))
             about_issuer = self._mentions(f"{title} {snippet}".upper(), terms)
             ranked.append((
                 about_issuer,
@@ -2510,6 +2541,7 @@ class YFinanceNewsProvider(BaseSearchProvider):
                 provider=self._name,
                 success=False,
                 error_message=f"{self._name} 无法从 '{stock_code}' 解析出 Yahoo 代码",
+                not_applicable=True,
             )
         return self._execute_search(
             query,
@@ -2747,6 +2779,7 @@ class ETFConstituentNewsProvider(BaseSearchProvider):
                 provider=self._name,
                 success=False,
                 error_message=f"{self._name} 无法解析 '{stock_code}' 的成分股（非 ETF 或仅持有现金类资产）",
+                not_applicable=True,
             )
         return self._execute_search(
             query,
@@ -3268,6 +3301,7 @@ class SearchService:
                 success=response.success,
                 error_message=response.error_message,
                 search_time=response.search_time,
+                not_applicable=response.not_applicable,
             ),
             len(chinese_results),
         )
@@ -4058,6 +4092,7 @@ class SearchService:
             success=response.success,
             error_message=response.error_message,
             search_time=response.search_time,
+            not_applicable=response.not_applicable,
         )
 
     @classmethod
@@ -4124,6 +4159,7 @@ class SearchService:
             success=response.success,
             error_message=response.error_message,
             search_time=response.search_time,
+            not_applicable=response.not_applicable,
         )
 
     @classmethod
@@ -4406,6 +4442,7 @@ class SearchService:
             success=response.success,
             error_message=response.error_message,
             search_time=response.search_time,
+            not_applicable=response.not_applicable,
         )
 
     def _normalize_and_limit_response(
@@ -4443,6 +4480,7 @@ class SearchService:
             success=response.success,
             error_message=response.error_message,
             search_time=response.search_time,
+            not_applicable=response.not_applicable,
         )
 
     @staticmethod
@@ -4466,6 +4504,7 @@ class SearchService:
             success=response.success,
             error_message=response.error_message,
             search_time=response.search_time,
+            not_applicable=response.not_applicable,
         )
 
     @staticmethod
@@ -4812,10 +4851,12 @@ class SearchService:
                 search_kwargs: Dict[str, Any] = {}
                 if isinstance(provider, TavilySearchProvider):
                     search_kwargs["topic"] = "news"
-                elif isinstance(provider, YFinanceNewsProvider):
-                    # It looks up a symbol rather than running the text query.
+                elif not getattr(provider, "supports_open_ended_queries", True):
+                    # Symbol-scoped sources (Finnhub, Yahoo and ETF constituent
+                    # news) cannot answer the text query without the target code.
                     search_kwargs["stock_code"] = stock_code
-                    search_kwargs["region"] = region
+                    if isinstance(provider, YFinanceNewsProvider):
+                        search_kwargs["region"] = region
                 elif isinstance(provider, BraveSearchProvider):
                     search_kwargs.update(
                         self._brave_search_locale(
@@ -4944,18 +4985,31 @@ class SearchService:
                         )
                 else:
                     filtered_count = len(filtered_response.results or []) if filtered_response.success else 0
+                    provider_not_applicable = bool(response.not_applicable)
                     self._record_news_search_run(
                         provider=provider.name,
                         operation="search_stock_news",
                         success=bool(filtered_response.success and filtered_response.results),
                         latency_ms=self._elapsed_ms(started_at),
                         record_count=filtered_count,
-                        error_type=None if filtered_count else "NoUsableNews",
+                        error_type=(
+                            None
+                            if filtered_count
+                            else "not_applicable"
+                            if provider_not_applicable
+                            else "NoUsableNews"
+                        ),
                         error_message=None if filtered_count else (
                             response.error_message or "过滤后无有效新闻"
                         ),
                     )
-                    if response.success and not filtered_response.results:
+                    if provider_not_applicable:
+                        logger.info(
+                            "%s 对当前标的不适用，跳过并继续下一引擎: %s",
+                            provider.name,
+                            response.error_message,
+                        )
+                    elif response.success and not filtered_response.results:
                         logger.info(
                             "%s 搜索成功但过滤后无有效新闻，继续尝试下一引擎",
                             provider.name,

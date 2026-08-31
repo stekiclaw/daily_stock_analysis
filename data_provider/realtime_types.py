@@ -101,10 +101,13 @@ class RealtimeSource(Enum):
     TICKFLOW = "tickflow"           # TickFlow
     TENCENT = "tencent"             # 腾讯直连
     SINA = "sina"                   # 新浪直连
+    YFINANCE = "yfinance"           # Yahoo Finance（美股/海外市场）
+    FINNHUB = "finnhub"             # Finnhub（美股）
+    ALPHA_VANTAGE = "alpha_vantage" # Alpha Vantage（美股）
     STOOQ = "stooq"                 # Stooq 美股兜底
     LONGBRIDGE = "longbridge"       # 长桥（美股/港股兜底）
     FUTU = "futu"                   # 富途 OpenD（港股）
-    FALLBACK = "fallback"           # 降级兜底
+    FALLBACK = "fallback"           # 无法识别具体 provider 的兼容兜底；真实降级由 fallback_from 表示
 
 
 @dataclass

@@ -11,10 +11,12 @@ prompt explicitly asks the model to reason about (放量/缩量, 换手率).
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from data_provider.realtime_types import RealtimeSource
 from data_provider.yfinance_fetcher import (
     YfinanceFetcher,
     _compute_yfinance_volume_signals,
     _estimate_yfinance_amount,
+    _resolve_yfinance_pb_ratio,
 )
 
 
@@ -71,6 +73,37 @@ class TestComputeYfinanceVolumeSignals:
         assert turnover_rate is None
 
 
+class TestResolveYfinancePbRatio:
+    """Yahoo P/B must not mix quote and financial-statement currencies."""
+
+    def test_cross_currency_adr_is_downgraded_without_threshold_guessing(self) -> None:
+        assert (
+            _resolve_yfinance_pb_ratio(
+                {
+                    "currency": "USD",
+                    "financialCurrency": "TWD",
+                    "priceToBook": 85.94378,
+                }
+            )
+            is None
+        )
+
+    def test_same_currency_keeps_provider_value(self) -> None:
+        assert (
+            _resolve_yfinance_pb_ratio(
+                {
+                    "currency": "USD",
+                    "financialCurrency": "USD",
+                    "priceToBook": 12.34,
+                }
+            )
+            == 12.34
+        )
+
+    def test_unknown_financial_currency_preserves_existing_behavior(self) -> None:
+        assert _resolve_yfinance_pb_ratio({"currency": "USD", "priceToBook": 12.34}) == 12.34
+
+
 class TestRealtimeQuoteCarriesVolumeSignals:
     """End-to-end through get_realtime_quote(), matching the app's real call path."""
 
@@ -98,6 +131,7 @@ class TestRealtimeQuoteCarriesVolumeSignals:
         quote = YfinanceFetcher().get_realtime_quote("NBIS")
 
         assert quote is not None
+        assert quote.source is RealtimeSource.YFINANCE
         assert quote.volume_ratio == round(13_088_800 / 23_000_000, 2)
         assert quote.turnover_rate == round(13_088_800 / 228_600_000 * 100, 4)
 
@@ -122,6 +156,37 @@ class TestRealtimeQuoteCarriesVolumeSignals:
         assert quote is not None
         assert quote.volume_ratio is None
         assert quote.turnover_rate is None
+
+    @patch("yfinance.Ticker")
+    def test_cross_currency_adr_quote_drops_pb_and_marks_it_missing(
+        self, ticker_factory: MagicMock
+    ) -> None:
+        ticker = ticker_factory.return_value
+        ticker.fast_info = SimpleNamespace(
+            lastPrice=417.52,
+            previousClose=427.30,
+            open=423.0,
+            dayHigh=425.0,
+            dayLow=415.0,
+            lastVolume=12_000_000,
+            marketCap=2_165_456_502_784,
+        )
+        ticker.info = {
+            "shortName": "Taiwan Semiconductor Manufacturing Company Limited",
+            "currency": "USD",
+            "financialCurrency": "TWD",
+            "trailingPE": 31.847445,
+            "priceToBook": 85.94378,
+            "averageVolume10days": 15_000_000,
+            "floatShares": 5_186_474_013,
+        }
+
+        quote = YfinanceFetcher().get_realtime_quote("TSM")
+
+        assert quote is not None
+        assert quote.pb_ratio is None
+        assert quote.missing_fields == ["pb_ratio"]
+        assert quote.data_quality == "partial"
 
 
 class TestEstimatedAmount:

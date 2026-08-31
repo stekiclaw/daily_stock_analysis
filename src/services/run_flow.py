@@ -380,6 +380,9 @@ def _append_provider_runs(
     }
     previous_node_by_type: Dict[str, Tuple[str, Dict[str, Any]]] = {}
     provider_success_by_block: Dict[str, str] = {}
+    primary_success_by_type: Dict[str, str] = {}
+    real_failure_before_success: Dict[str, bool] = defaultdict(bool)
+    seen_providers_by_type: Dict[str, set[str]] = defaultdict(set)
     attempt_index_by_type: Dict[str, int] = defaultdict(int)
 
     for index, raw_run in enumerate(provider_runs, start=1):
@@ -393,13 +396,41 @@ def _append_provider_runs(
         label = _DATA_TYPE_LABELS.get(data_type, data_type)
         node_id = f"provider_{_safe_key(data_type)}_{_safe_key(provider)}_{attempt_index}"
         success = run.get("success") is True
-        had_previous_failure = data_type in previous_node_by_type and previous_node_by_type[data_type][1].get("success") is False
-        status = _provider_run_status(run, had_previous_failure=had_previous_failure)
+        provider_identity = _safe_key(provider) or "unknown"
+        seen_providers = seen_providers_by_type[data_type]
+        if provider_identity in seen_providers and data_type in primary_success_by_type:
+            # A repeated provider after a completed primary denotes a new
+            # invocation of the same chain, not enrichment of the old one.
+            previous_node_by_type.pop(data_type, None)
+            primary_success_by_type.pop(data_type, None)
+            real_failure_before_success[data_type] = False
+            seen_providers.clear()
+        seen_providers.add(provider_identity)
+        primary_already_succeeded = data_type in primary_success_by_type
+        role = "supplement" if primary_already_succeeded else "primary"
+        status = _provider_run_status(
+            run,
+            primary_already_succeeded=primary_already_succeeded,
+            had_real_failure_before_success=real_failure_before_success[data_type],
+        )
+        if not success and not primary_already_succeeded and _is_real_provider_failure(run):
+            real_failure_before_success[data_type] = True
         duration_ms = _safe_int(run.get("latency_ms"))
         timestamp = _datetime_to_iso(run.get("created_at"))
         started_at = _started_at_from_end_and_duration(timestamp, duration_ms)
-        message = _provider_run_message(label, provider, run, success=success)
+        message = _provider_run_message(
+            label,
+            provider,
+            run,
+            success=success,
+            status=status,
+            role=role,
+        )
         block_key = _DATA_TYPE_TO_BLOCK_KEY.get(data_type, data_type)
+        flow_run = dict(run)
+        flow_run["_flow_status"] = status
+        flow_run["_flow_role"] = role
+        flow_run["_primary_already_succeeded"] = primary_already_succeeded
 
         _put_node(
             nodes,
@@ -419,6 +450,7 @@ def _append_provider_runs(
                 "data_type": data_type,
                 "operation": run.get("operation"),
                 "attempt": attempt_index,
+                "role": role,
                 "fallback_from": run.get("fallback_from"),
                 "fallback_to": run.get("fallback_to"),
                 "cache_hit": run.get("cache_hit"),
@@ -431,42 +463,62 @@ def _append_provider_runs(
         previous = previous_node_by_type.get(data_type)
         if previous:
             previous_node_id, previous_run = previous
-            edge_kind = _provider_transition_kind(previous_run, run)
+            edge_kind = _provider_transition_kind(previous_run, flow_run)
+            if edge_kind == "fallback":
+                edge_label = "降级"
+            elif edge_kind == "retry":
+                edge_label = "重试"
+            elif role == "supplement":
+                edge_label = "补充"
+            elif status == "skipped":
+                edge_label = "跳过"
+            else:
+                edge_label = "流转"
             _append_edge(
                 edges,
                 previous_node_id,
                 node_id,
                 edge_kind,
                 status,
-                label="降级" if edge_kind == "fallback" else "重试",
+                label=edge_label,
                 message=_safe_text(run.get("fallback_from") or run.get("fallback_to"), max_length=120),
             )
         else:
             _append_edge(edges, "task_queue", node_id, "control", status, label="调用")
 
-        if success:
-            provider_success_by_block[block_key] = node_id
+        if success and not primary_already_succeeded:
+            primary_success_by_type[data_type] = node_id
+            provider_success_by_block.setdefault(block_key, node_id)
 
-        severity = "success" if success else ("warning" if success_by_data_type.get(data_type) else "danger")
+        if status == "skipped":
+            severity = "info"
+            event_outcome = "跳过"
+        elif success:
+            severity = "success"
+            event_outcome = "补充完成" if role == "supplement" else "成功"
+        else:
+            severity = "warning" if success_by_data_type.get(data_type) else "danger"
+            event_outcome = "失败"
         _append_event(
             events,
             "provider_run",
             node_id=node_id,
             timestamp=timestamp,
             severity=severity,
-            title=f"{label}{'成功' if success else '失败'}",
+            title=f"{label}{event_outcome}",
             message=message,
             metadata={
                 "provider": provider,
                 "data_type": data_type,
                 "duration_ms": duration_ms,
                 "record_count": run.get("record_count"),
+                "role": role,
                 "fallback_from": run.get("fallback_from"),
                 "fallback_to": run.get("fallback_to"),
                 "error_type": run.get("error_type"),
             },
         )
-        previous_node_by_type[data_type] = (node_id, run)
+        previous_node_by_type[data_type] = (node_id, flow_run)
 
     return provider_success_by_block
 
@@ -945,6 +997,8 @@ def _append_active_flow_events(
 
     known_node_ids = set(nodes)
     last_provider_node_by_type: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+    seen_provider_by_type: Dict[str, set[str]] = defaultdict(set)
+    primary_succeeded_by_type: set[str] = set()
     last_llm_node: Optional[str] = None
     last_history_node: Optional[str] = None
 
@@ -991,12 +1045,26 @@ def _append_active_flow_events(
                 "success": event.get("severity") == "success" or nodes[node_id].get("status") in {"success", "fallback"},
                 "fallback_from": metadata.get("fallback_from"),
                 "fallback_to": metadata.get("fallback_to"),
+                "error_type": metadata.get("error_type"),
+                "_flow_status": nodes[node_id].get("status"),
+                "_flow_role": metadata.get("role"),
             }
 
         if node_id and node_id in nodes and node_id in known_node_ids:
             _refresh_incoming_edge_status(edges, node_id, nodes[node_id].get("status"))
             if provider_data_type and provider_run:
+                _refresh_incoming_provider_transition(
+                    edges,
+                    node_id,
+                    status=nodes[node_id].get("status"),
+                    role=metadata.get("role"),
+                )
                 last_provider_node_by_type[provider_data_type] = (node_id, provider_run)
+                if (
+                    provider_run.get("success") is True
+                    and str(metadata.get("role") or "").strip().lower() == "primary"
+                ):
+                    primary_succeeded_by_type.add(provider_data_type)
             elif event_type in {"llm_run", "llm_run_started"}:
                 last_llm_node = node_id
             elif event_type == "history_run":
@@ -1004,6 +1072,16 @@ def _append_active_flow_events(
 
         if node_id and node_id in nodes and node_id not in known_node_ids:
             if provider_data_type and provider_run:
+                provider_identity = _safe_key(provider_run.get("provider")) or "unknown"
+                seen_providers = seen_provider_by_type[provider_data_type]
+                if (
+                    provider_identity in seen_providers
+                    and provider_data_type in primary_succeeded_by_type
+                ):
+                    last_provider_node_by_type.pop(provider_data_type, None)
+                    primary_succeeded_by_type.discard(provider_data_type)
+                    seen_providers.clear()
+                seen_providers.add(provider_identity)
                 previous_provider = last_provider_node_by_type.get(provider_data_type)
                 if previous_provider:
                     previous_provider_node, previous_provider_run = previous_provider
@@ -1019,6 +1097,12 @@ def _append_active_flow_events(
                 else:
                     _append_edge(edges, "task_queue", node_id, "control", nodes[node_id].get("status", "unknown"), label="调用")
                 last_provider_node_by_type[provider_data_type] = (node_id, provider_run)
+                if (
+                    event_type == "provider_run"
+                    and provider_run.get("success") is True
+                    and str(metadata.get("role") or "").strip().lower() == "primary"
+                ):
+                    primary_succeeded_by_type.add(provider_data_type)
             elif event_type in {"llm_run", "llm_run_started"}:
                 anchor = "analysis_pipeline" if "analysis_pipeline" in nodes else "task_queue"
                 _append_edge(edges, anchor, node_id, "data", nodes[node_id].get("status", "unknown"), label="生成")
@@ -1065,13 +1149,45 @@ def _group_provider_runs(provider_runs: List[Any]) -> Dict[str, List[Dict[str, A
     return grouped
 
 
-def _provider_run_status(run: Dict[str, Any], *, had_previous_failure: bool) -> str:
+_SKIPPED_PROVIDER_ERROR_TYPES = {
+    "unavailable",
+    "not_available",
+    "not_configured",
+    "not_applicable",
+    "unsupported",
+    "skipped",
+}
+
+
+def _provider_error_type(run: Dict[str, Any]) -> str:
+    return str(run.get("error_type") or "").strip().lower()
+
+
+def _is_skipped_provider_run(run: Dict[str, Any]) -> bool:
+    return _provider_error_type(run) in _SKIPPED_PROVIDER_ERROR_TYPES
+
+
+def _is_real_provider_failure(run: Dict[str, Any]) -> bool:
+    return run.get("success") is False and not _is_skipped_provider_run(run)
+
+
+def _provider_run_status(
+    run: Dict[str, Any],
+    *,
+    primary_already_succeeded: bool,
+    had_real_failure_before_success: bool,
+) -> str:
     if run.get("success") is True:
-        if run.get("fallback_from") or had_previous_failure:
+        # Once a data type has a primary success, later calls are enrichment,
+        # never fallback attempts—even if an old recorder left fallback metadata.
+        if primary_already_succeeded:
+            return "success"
+        if run.get("fallback_from") or had_real_failure_before_success:
             return "fallback"
         return "success"
-    error_type = str(run.get("error_type") or "").lower()
-    if "timeout" in error_type:
+    if _is_skipped_provider_run(run):
+        return "skipped"
+    if "timeout" in _provider_error_type(run):
         return "timeout"
     return "failed"
 
@@ -1079,13 +1195,28 @@ def _provider_run_status(run: Dict[str, Any], *, had_previous_failure: bool) -> 
 def _provider_transition_kind(previous_run: Dict[str, Any], current_run: Dict[str, Any]) -> str:
     previous_provider = _safe_text(previous_run.get("provider"), max_length=80)
     current_provider = _safe_text(current_run.get("provider"), max_length=80)
-    if previous_run.get("fallback_to") or current_run.get("fallback_from"):
-        return "fallback"
+    current_role = current_run.get("_flow_role")
+    current_status = current_run.get("_flow_status")
+
+    if current_role == "supplement" or current_status == "skipped":
+        return "data"
     if previous_provider and previous_provider == current_provider:
         return "retry"
-    if previous_run.get("success") is False:
+    # ``_provider_run_status`` already proved that the first successful source
+    # follows a real failure (or carries explicit fallback metadata).  A skipped
+    # provider may sit between that failure and the success, so checking only the
+    # immediately preceding run would lose the real fallback transition.
+    if current_status == "fallback":
         return "fallback"
     return "data"
+
+
+def _is_optional_supplement_node(node: Mapping[str, Any]) -> bool:
+    metadata = _as_mapping(node.get("metadata"))
+    return (
+        node.get("kind") == "data_source"
+        and str(metadata.get("role") or "").strip().lower() == "supplement"
+    )
 
 
 def _history_snapshot_status(
@@ -1093,7 +1224,6 @@ def _history_snapshot_status(
     diagnostics: Dict[str, Any],
     overview: Optional[Dict[str, Any]],
 ) -> str:
-    statuses = [node.get("status") for node in nodes.values()]
     has_diagnostics = bool(diagnostics)
     has_overview = bool(overview)
     if not has_diagnostics and not has_overview:
@@ -1104,7 +1234,11 @@ def _history_snapshot_status(
         for node in nodes.values()
     ):
         return "failed"
-    if any(status in {"failed", "timeout", "degraded", "fallback"} for status in statuses):
+    if any(
+        node.get("status") in {"failed", "timeout", "degraded", "fallback"}
+        and not _is_optional_supplement_node(node)
+        for node in nodes.values()
+    ):
         return "degraded"
     return "success"
 
@@ -1112,15 +1246,20 @@ def _history_snapshot_status(
 def _context_pack_status(overview: Optional[Dict[str, Any]]) -> str:
     if not overview:
         return "unknown"
-    block_statuses = [
-        _CONTEXT_STATUS_TO_FLOW.get(str(_as_mapping(block).get("status") or ""), "unknown")
+    raw_statuses = [
+        str(_as_mapping(block).get("status") or "")
         for block in _as_list(overview.get("blocks"))
     ]
-    if not block_statuses:
+    if not raw_statuses:
         return "unknown"
-    if any(status in {"failed", "fallback", "degraded", "skipped"} for status in block_statuses):
+    if any(
+        status in {"fetch_failed", "fallback", "partial", "stale", "estimated", "missing"}
+        for status in raw_statuses
+    ):
         return "degraded"
-    if all(status == "success" for status in block_statuses):
+    # Structural not_supported blocks are honest capability boundaries, not a
+    # degraded execution. They remain skipped nodes but do not taint the run.
+    if all(status in {"available", "not_supported"} for status in raw_statuses):
         return "success"
     return "unknown"
 
@@ -1158,12 +1297,23 @@ def _context_block_message(block: Dict[str, Any]) -> str:
     return f"输入块状态为 {status or 'unknown'}"
 
 
-def _provider_run_message(label: str, provider: str, run: Dict[str, Any], *, success: bool) -> str:
+def _provider_run_message(
+    label: str,
+    provider: str,
+    run: Dict[str, Any],
+    *,
+    success: bool,
+    status: str,
+    role: str,
+) -> str:
     if success:
         record_count = _safe_int(run.get("record_count"))
         suffix = f"，返回 {record_count} 条" if record_count is not None else ""
-        return f"{label} {provider} 成功{suffix}"
+        action = "补充成功" if role == "supplement" else "成功"
+        return f"{label} {provider} {action}{suffix}"
     error = _safe_text(run.get("error_message_sanitized") or run.get("error_type"), max_length=160)
+    if status == "skipped":
+        return f"{label} {provider} 跳过：{error or '当前未配置或不适用'}"
     return f"{label} {provider} 失败：{error or '未知错误'}"
 
 
@@ -1216,11 +1366,12 @@ def _build_summary(
         for node in nodes.values()
         if node.get("status") in {"failed", "timeout"}
         and node.get("kind") in {"data_source", "model", "artifact", "notification"}
+        and not _is_optional_supplement_node(node)
     )
     fallback_count = sum(
         1
         for edge in edges
-        if edge.get("kind") in {"fallback", "retry"}
+        if edge.get("kind") == "fallback"
     )
     data_source_count = sum(1 for node in nodes.values() if node.get("kind") == "data_source")
     model = next(
@@ -1328,6 +1479,40 @@ def _refresh_incoming_edge_status(
     for edge in edges:
         if edge.get("to") == node_id:
             edge["status"] = valid_status
+
+
+def _refresh_incoming_provider_transition(
+    edges: List[Dict[str, Any]],
+    node_id: Optional[str],
+    *,
+    status: Optional[Any],
+    role: Optional[Any],
+) -> None:
+    """Finalize an edge first created by a provider ``started`` event.
+
+    Active-flow edges are inserted while the provider is still running, before
+    the final event can classify it as fallback, supplement, or skipped.  Keep
+    the edge identity and summary aligned with that final observed outcome.
+    """
+    if not node_id:
+        return
+    status_value = str(status or "").strip().lower()
+    role_value = str(role or "").strip().lower()
+    if status_value == "fallback":
+        kind, label = "fallback", "降级"
+    elif status_value == "skipped":
+        kind, label = "data", "跳过"
+    elif role_value == "supplement":
+        kind, label = "data", "补充"
+    else:
+        return
+
+    for edge in edges:
+        if edge.get("to") != node_id or edge.get("from") == "task_queue":
+            continue
+        edge["kind"] = kind
+        edge["label"] = label
+        edge["id"] = f"{edge.get('from')}_to_{node_id}_{kind}"
 
 
 def _append_event(

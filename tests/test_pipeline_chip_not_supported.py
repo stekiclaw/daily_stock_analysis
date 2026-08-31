@@ -11,8 +11,11 @@ the underlying fetchers already knew and logged the distinction.
 """
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from src.core.pipeline import StockAnalysisPipeline
+from src.schemas.analysis_context_pack import ContextFieldStatus
+from src.services.analysis_context_builder import AnalysisContextBuilder
 
 
 def _make_pipeline() -> StockAnalysisPipeline:
@@ -59,3 +62,93 @@ def test_index_target_skip_sets_chip_not_supported():
     from src.core.pipeline import INDEX_SKIP_MODULES
 
     assert "chip_distribution" in INDEX_SKIP_MODULES
+
+
+def test_unsupported_us_target_never_calls_chip_provider():
+    pipeline = _make_pipeline()
+    pipeline.fetcher_manager = SimpleNamespace(
+        is_chip_distribution_unsupported_market=MagicMock(return_value=True),
+        get_chip_distribution=MagicMock(),
+    )
+
+    chip_data, not_supported = pipeline._fetch_chip_distribution_for_target(
+        code="MSFT",
+        stock_name="Microsoft Corporation",
+        is_index=False,
+    )
+
+    assert chip_data is None
+    assert not_supported is True
+    pipeline.fetcher_manager.get_chip_distribution.assert_not_called()
+
+
+def test_supported_target_calls_chip_provider_and_is_not_structural_gap():
+    chip = SimpleNamespace(profit_ratio=0.6, concentration_90=0.2)
+    pipeline = _make_pipeline()
+    pipeline.fetcher_manager = SimpleNamespace(
+        is_chip_distribution_unsupported_market=MagicMock(return_value=False),
+        get_chip_distribution=MagicMock(return_value=chip),
+    )
+
+    chip_data, not_supported = pipeline._fetch_chip_distribution_for_target(
+        code="600519",
+        stock_name="贵州茅台",
+        is_index=False,
+    )
+
+    assert chip_data is chip
+    assert not_supported is False
+    pipeline.fetcher_manager.get_chip_distribution.assert_called_once_with("600519")
+
+
+def test_agent_artifacts_receive_chip_not_supported_flag():
+    artifacts = _make_pipeline()._build_agent_analysis_artifacts(
+        code="MSFT",
+        stock_name="Microsoft Corporation",
+        market="us",
+        phase=None,
+        initial_context={},
+        fundamental_context=None,
+        query_id="agent-q1",
+        base_context={"code": "MSFT", "today": {}, "yesterday": {}},
+        chip_not_supported=True,
+    )
+
+    assert artifacts.metadata["chip_not_supported"] is True
+
+
+def test_agent_final_artifacts_use_real_runtime_news_content_and_count():
+    pipeline = _make_pipeline()
+    news_content = pipeline._merge_agent_news_context(
+        None,
+        "## Agent 运行期新闻证据\n1. Microsoft update",
+    )
+    artifacts = pipeline._build_agent_analysis_artifacts(
+        code="MSFT",
+        stock_name="Microsoft Corporation",
+        market="us",
+        phase=None,
+        initial_context={"news_context": news_content},
+        fundamental_context=None,
+        query_id="agent-q2",
+        base_context={"code": "MSFT", "today": {}, "yesterday": {}},
+        chip_not_supported=True,
+        news_result_count=1,
+    )
+
+    pack = AnalysisContextBuilder.build(artifacts)
+    assert pack.blocks["news"].status == ContextFieldStatus.AVAILABLE
+    assert pack.blocks["news"].items["content"].value == news_content
+    assert pack.blocks["chip"].status == ContextFieldStatus.NOT_SUPPORTED
+    assert pack.metadata["news_result_count"] == 1
+
+
+def test_agent_pretool_summary_warns_that_news_state_is_pending_runtime_tools():
+    summary = _make_pipeline()._append_agent_runtime_news_note(
+        "summary says news missing",
+        report_language="zh",
+        search_available=True,
+    )
+
+    assert "工具调用前" in summary
+    assert "工具已返回真实证据时，不得再写新闻缺失" in summary

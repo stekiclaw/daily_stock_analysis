@@ -113,6 +113,13 @@ def test_quote_block_maps_available_missing_fallback_and_explicit_stale() -> Non
     assert available.source == "akshare_em"
     assert available.items["price"].value == 1880.0
 
+    yfinance_primary = AnalysisContextBuilder.build(
+        _artifacts(realtime_quote=_quote(RealtimeSource.YFINANCE))
+    ).blocks["quote"]
+    assert yfinance_primary.status == ContextFieldStatus.AVAILABLE
+    assert yfinance_primary.source == "yfinance"
+    assert "realtime_provider_fallback" not in yfinance_primary.warnings
+
     missing = AnalysisContextBuilder.build(
         _artifacts(realtime_quote=None)
     ).blocks["quote"]

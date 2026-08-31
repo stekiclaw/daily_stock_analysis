@@ -293,6 +293,139 @@ class RunDiagnosticsP2TestCase(unittest.TestCase):
             ["daily_bars_missing"],
         )
 
+    def test_partial_fundamentals_degrade_analysis_input_summary(self) -> None:
+        diagnostics = _diagnostic_snapshot()
+        diagnostics["provider_runs"] = [
+            {
+                "data_type": "realtime_quote",
+                "provider": "QuoteFetcher",
+                "success": True,
+            },
+            {
+                "data_type": "daily_data",
+                "provider": "DailyFetcher",
+                "success": True,
+                "record_count": 30,
+            },
+        ]
+        overview = _analysis_context_overview(
+            blocks=[
+                {"key": "quote", "label": "行情", "status": "available"},
+                {"key": "daily_bars", "label": "日线", "status": "available"},
+                {
+                    "key": "fundamentals",
+                    "label": "基本面",
+                    "status": "partial",
+                    "source": "realtime_quote",
+                },
+                {
+                    "key": "chip",
+                    "label": "筹码",
+                    "status": "not_supported",
+                    "missing_reasons": ["chip_not_supported"],
+                },
+            ]
+        )
+        overview["data_quality"] = {"overall_score": 96, "level": "good"}
+
+        summary = build_run_diagnostic_summary(
+            context_snapshot={
+                "diagnostics": diagnostics,
+                "analysis_context_pack_overview": overview,
+            },
+            raw_result={"success": True, "model_used": "deepseek-chat"},
+            report_saved=True,
+        )
+
+        analysis_input = summary["components"]["analysis_input"]
+        self.assertEqual(summary["status"], "degraded")
+        self.assertEqual(analysis_input["status"], "degraded")
+        self.assertIn("基本面", analysis_input["message"])
+        self.assertEqual(analysis_input["details"]["overall_score"], 96)
+        self.assertEqual(
+            analysis_input["details"]["affected_blocks"][0]["status"],
+            "partial",
+        )
+        self.assertEqual(
+            analysis_input["details"]["not_supported_blocks"][0]["status"],
+            "not_supported",
+        )
+
+    def test_structural_not_supported_input_does_not_degrade_summary(self) -> None:
+        diagnostics = _diagnostic_snapshot()
+        diagnostics["provider_runs"] = [
+            {
+                "data_type": "realtime_quote",
+                "provider": "QuoteFetcher",
+                "success": True,
+            },
+            {
+                "data_type": "daily_data",
+                "provider": "DailyFetcher",
+                "success": True,
+                "record_count": 30,
+            },
+        ]
+        overview = _analysis_context_overview(
+            blocks=[
+                {"key": "quote", "label": "行情", "status": "available"},
+                {"key": "daily_bars", "label": "日线", "status": "available"},
+                {
+                    "key": "chip",
+                    "label": "筹码",
+                    "status": "not_supported",
+                    "missing_reasons": ["chip_not_supported"],
+                },
+            ]
+        )
+
+        summary = build_run_diagnostic_summary(
+            context_snapshot={
+                "diagnostics": diagnostics,
+                "analysis_context_pack_overview": overview,
+            },
+            raw_result={"success": True, "model_used": "deepseek-chat"},
+            report_saved=True,
+        )
+
+        analysis_input = summary["components"]["analysis_input"]
+        self.assertEqual(summary["status"], "normal")
+        self.assertEqual(analysis_input["status"], "ok")
+        self.assertIn("结构性不支持", analysis_input["message"])
+
+    def test_market_light_partial_metadata_does_not_override_available_block(self) -> None:
+        diagnostics = _diagnostic_snapshot()
+        diagnostics["provider_runs"] = []
+        overview = _analysis_context_overview(
+            blocks=[
+                {
+                    "key": "market_review",
+                    "label": "大盘复盘",
+                    "status": "available",
+                    "source": "market_review",
+                }
+            ]
+        )
+        overview["metadata"] = {
+            "scope": "market_review",
+            "market_light_data_quality": ["partial"],
+        }
+        overview["data_quality"] = {"overall_score": 100, "level": "good"}
+
+        summary = build_run_diagnostic_summary(
+            context_snapshot={
+                "diagnostics": diagnostics,
+                "analysis_context_pack_overview": overview,
+            },
+            raw_result={"success": True, "model_used": "deepseek-chat"},
+            report_saved=True,
+        )
+
+        analysis_input = summary["components"]["analysis_input"]
+        self.assertEqual(summary["status"], "normal")
+        self.assertEqual(analysis_input["status"], "ok")
+        self.assertEqual(analysis_input["details"]["overall_score"], 100)
+
     def test_news_input_missing_mentions_followup_related_news_scope(self) -> None:
         summary = build_run_diagnostic_summary(
             context_snapshot={
@@ -350,6 +483,102 @@ class RunDiagnosticsP2TestCase(unittest.TestCase):
         self.assertEqual(news["details"]["evidence_scope"], "retrieval_vs_analysis_input")
         self.assertIn("新闻检索返回 3 条结果", news["message"])
         self.assertIn("未进入本次分析输入", news["message"])
+
+    def test_news_provider_fallback_degrades_diagnostics_even_with_results(self) -> None:
+        diagnostics = _diagnostic_snapshot()
+        diagnostics["provider_runs"].extend(
+            [
+                {
+                    "data_type": "news_search",
+                    "provider": "Tavily",
+                    "success": False,
+                    "error_type": "NoUsableNews",
+                    "record_count": 0,
+                },
+                {
+                    "data_type": "news_search",
+                    "provider": "FinnhubNews",
+                    "success": True,
+                    "record_count": 3,
+                },
+            ]
+        )
+
+        summary = build_run_diagnostic_summary(
+            context_snapshot={
+                "diagnostics": diagnostics,
+                "news_result_count": 3,
+            },
+            raw_result={"success": True, "model_used": "deepseek-chat"},
+            report_saved=True,
+        )
+
+        news = summary["components"]["news"]
+        self.assertEqual(summary["status"], "degraded")
+        self.assertEqual(news["status"], "degraded")
+        self.assertEqual(news["details"]["fallback_count"], 1)
+        self.assertEqual(news["details"]["failed_attempts"], 1)
+        self.assertEqual(news["details"]["providers"], ["FinnhubNews"])
+        self.assertIn("前置数据源失败后降级成功", news["message"])
+
+    def test_market_review_repeated_news_chains_report_each_fallback(self) -> None:
+        diagnostics = _diagnostic_snapshot()
+        diagnostics["provider_runs"] = []
+        for _ in range(3):
+            diagnostics["provider_runs"].extend(
+                [
+                    {
+                        "data_type": "news_search",
+                        "provider": "Tavily",
+                        "success": False,
+                        "error_type": "NoUsableNews",
+                    },
+                    {
+                        "data_type": "news_search",
+                        "provider": "SearXNG",
+                        "success": False,
+                        "error_type": "NoUsableNews",
+                    },
+                    {
+                        "data_type": "news_search",
+                        "provider": "FinnhubNews",
+                        "success": False,
+                        "error_type": "not_applicable",
+                    },
+                    {
+                        "data_type": "news_search",
+                        "provider": "YFinanceNews",
+                        "success": True,
+                        "record_count": 2,
+                    },
+                    {
+                        "data_type": "news_search",
+                        "provider": "ETFConstituentNews",
+                        "success": False,
+                        "error_type": "not_applicable",
+                    },
+                ]
+            )
+
+        summary = build_run_diagnostic_summary(
+            context_snapshot={
+                "diagnostics": diagnostics,
+                "market_review_payload": {
+                    "kind": "market_review",
+                    "news": [{"title": "A"}, {"title": "B"}],
+                },
+            },
+            raw_result={"success": True, "model_used": "deepseek-chat"},
+            report_saved=True,
+        )
+
+        news = summary["components"]["news"]
+        self.assertEqual(summary["status"], "degraded")
+        self.assertEqual(news["details"]["record_count"], 2)
+        self.assertEqual(news["details"]["chain_count"], 3)
+        self.assertEqual(news["details"]["fallback_count"], 3)
+        self.assertEqual(news["details"]["failed_attempts"], 6)
+        self.assertEqual(news["details"]["skipped_providers"], ["FinnhubNews", "ETFConstituentNews"])
 
     def test_summary_marks_llm_failure_as_failed(self) -> None:
         diagnostics = _diagnostic_snapshot()

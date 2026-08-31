@@ -17,6 +17,7 @@ A股自选股智能分析系统 - 通知层
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -64,6 +65,9 @@ from bot.models import BotMessage
 from src.utils.sanitize import sanitize_diagnostic_text
 from src.formatters import strip_hidden_markdown_metadata
 from src.utils.data_processing import (
+    display_fraction_as_percent,
+    display_numeric_with_suffix,
+    display_value_or_na,
     signal_attribution_has_content,
     signal_attribution_weight_items,
     normalize_model_used,
@@ -92,23 +96,19 @@ logger = logging.getLogger(__name__)
 
 
 def _safe_float(value: Any) -> Optional[float]:
-    """Best-effort float conversion; handles `"3.2%"` and `"1,234"` shapes."""
-    if value is None:
+    """Best-effort finite float conversion for report-facing numeric fields."""
+    if value is None or isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
     text = str(value).strip().replace(",", "")
     if text.endswith("%"):
         text = text[:-1].strip()
     if not text:
         return None
     try:
-        return float(text)
+        numeric_value = float(text)
     except (TypeError, ValueError):
         return None
+    return numeric_value if math.isfinite(numeric_value) else None
 
 
 def _format_strategy_skill_items(items: Any, report_language: str = "zh") -> str:
@@ -125,8 +125,9 @@ def _format_strategy_skill_items(items: Any, report_language: str = "zh") -> str
         if not skill_id:
             continue
         suffix = f"/{localize_strategy_signal(signal, report_language)}" if signal else ""
-        if isinstance(confidence, (int, float)):
-            suffix += f"/{confidence:.0%}"
+        confidence_text = display_fraction_as_percent(confidence)
+        if confidence_text != "N/A":
+            suffix += f"/{confidence_text}"
         formatted.append(f"{localize_strategy_skill(skill_id, report_language)}{suffix}")
     return "、".join(formatted) if formatted else none_text
 
@@ -136,7 +137,10 @@ def _append_strategy_synthesis_block(lines: List[str], strategy_synthesis: Any, 
     if not strategy_synthesis:
         return
     confidence = strategy_synthesis.get("confidence")
-    confidence_text = f"{confidence:.0%}" if isinstance(confidence, (int, float)) else "N/A"
+    confidence_text = display_fraction_as_percent(confidence)
+    conflict_count_text = display_value_or_na(
+        strategy_synthesis.get("conflict_count")
+    )
     lines.extend([
         f"### 🧩 {labels['strategy_synthesis_heading']}",
         "",
@@ -147,7 +151,7 @@ def _append_strategy_synthesis_block(lines: List[str], strategy_synthesis: Any, 
             f"{localize_consensus_level(strategy_synthesis.get('consensus_level', 'N/A'), report_language)} | "
             f"{labels['strategy_conflict_label']}: "
             f"{localize_conflict_severity(strategy_synthesis.get('conflict_severity', 'none'), report_language)} "
-            f"({strategy_synthesis.get('conflict_count', 0)}) | "
+            f"({conflict_count_text}) | "
             f"{labels['strategy_confidence_label']}: {confidence_text}"
         ),
     ])
@@ -1116,22 +1120,17 @@ class NotificationService(
 
     @staticmethod
     def _clean_sniper_value(value: Any) -> str:
-        """Normalize sniper point values and remove redundant label prefixes."""
-        if value is None:
-            return 'N/A'
-        if isinstance(value, (int, float)):
-            return str(value)
-        if not isinstance(value, str):
-            return str(value)
-        if not value or value == 'N/A':
-            return value
+        """Normalize sniper values and remove redundant label prefixes."""
+        rendered = display_value_or_na(value)
+        if rendered == "N/A":
+            return rendered
         prefixes = ['理想买入点：', '次优买入点：', '止损位：', '目标位：',
                      '理想买入点:', '次优买入点:', '止损位:', '目标位:',
                      'Ideal Entry:', 'Secondary Entry:', 'Stop Loss:', 'Target:']
         for prefix in prefixes:
-            if value.startswith(prefix):
-                return value[len(prefix):]
-        return value
+            if rendered.startswith(prefix):
+                return display_value_or_na(rendered[len(prefix):])
+        return rendered
 
     @staticmethod
     def _phase_decision_list(value: Any) -> List[str]:
@@ -1365,35 +1364,52 @@ class NotificationService(
                     ])
                     # 舆情情绪总结
                     if intel.get('sentiment_summary'):
-                        report_lines.append(f"**💭 {labels['sentiment_summary_label']}**: {intel['sentiment_summary']}")
+                        report_lines.append(
+                            f"**💭 {labels['sentiment_summary_label']}**: "
+                            f"{display_value_or_na(intel.get('sentiment_summary'))}"
+                        )
                     # 业绩预期
                     if intel.get('earnings_outlook'):
-                        report_lines.append(f"**📊 {labels['earnings_outlook_label']}**: {intel['earnings_outlook']}")
+                        report_lines.append(
+                            f"**📊 {labels['earnings_outlook_label']}**: "
+                            f"{display_value_or_na(intel.get('earnings_outlook'))}"
+                        )
                     # 风险警报（醒目显示）
                     risk_alerts = intel.get('risk_alerts', [])
                     if risk_alerts:
                         report_lines.append("")
                         report_lines.append(f"**🚨 {labels['risk_alerts_label']}**:")
                         for alert in risk_alerts:
-                            report_lines.append(f"- {alert}")
+                            report_lines.append(f"- {display_value_or_na(alert)}")
                     # 利好催化
                     catalysts = intel.get('positive_catalysts', [])
                     if catalysts:
                         report_lines.append("")
                         report_lines.append(f"**✨ {labels['positive_catalysts_label']}**:")
                         for cat in catalysts:
-                            report_lines.append(f"- {cat}")
+                            report_lines.append(f"- {display_value_or_na(cat)}")
                     # 最新消息
                     if intel.get('latest_news'):
                         report_lines.append("")
-                        report_lines.append(f"**📢 {labels['latest_news_label']}**: {intel['latest_news']}")
+                        report_lines.append(
+                            f"**📢 {labels['latest_news_label']}**: "
+                            f"{display_value_or_na(intel.get('latest_news'))}"
+                        )
                     report_lines.append("")
 
                 # ========== 核心结论 ==========
-                core = dashboard.get('core_conclusion', {}) if dashboard else {}
-                one_sentence = core.get('one_sentence', result.analysis_summary)
-                time_sense = core.get('time_sensitivity', labels['default_time_sensitivity'])
-                pos_advice = core.get('position_advice', {})
+                raw_core = dashboard.get('core_conclusion') if dashboard else None
+                core = raw_core if isinstance(raw_core, dict) else {}
+                one_sentence = display_value_or_na(
+                    core.get('one_sentence'),
+                    display_value_or_na(result.analysis_summary),
+                )
+                time_sense = display_value_or_na(
+                    core.get('time_sensitivity'),
+                    labels['default_time_sensitivity'],
+                )
+                raw_pos_advice = core.get('position_advice')
+                pos_advice = raw_pos_advice if isinstance(raw_pos_advice, dict) else {}
 
                 report_lines.extend([
                     f"### 📌 {labels['core_conclusion_heading']}",
@@ -1410,8 +1426,10 @@ class NotificationService(
                     report_lines.extend([
                         f"| {labels['position_status_label']} | {labels['action_advice_label']} |",
                         "|---------|---------|",
-                        f"| 🆕 **{labels['no_position_label']}** | {pos_advice.get('no_position', self._get_display_operation_advice(result, report_language))} |",
-                        f"| 💼 **{labels['has_position_label']}** | {pos_advice.get('has_position', labels['continue_holding'])} |",
+                        f"| 🆕 **{labels['no_position_label']}** | "
+                        f"{display_value_or_na(pos_advice.get('no_position'), self._get_display_operation_advice(result, report_language))} |",
+                        f"| 💼 **{labels['has_position_label']}** | "
+                        f"{display_value_or_na(pos_advice.get('has_position'), labels['continue_holding'])} |",
                         "",
                     ])
 
@@ -1437,32 +1455,34 @@ class NotificationService(
                             else f"❌ {labels['no_label']}"
                         )
                         report_lines.extend([
-                            f"**{labels['ma_alignment_label']}**: {trend_data.get('ma_alignment', 'N/A')} | "
+                            f"**{labels['ma_alignment_label']}**: {display_value_or_na(trend_data.get('ma_alignment'))} | "
                             f"{labels['bullish_alignment_label']}: {is_bullish} | "
-                            f"{labels['trend_strength_label']}: {trend_data.get('trend_score', 'N/A')}/100",
+                            f"{labels['trend_strength_label']}: {display_numeric_with_suffix(trend_data.get('trend_score'), '/100')}",
                             "",
                         ])
                     # 价格位置
                     if price_data:
                         bias_status = price_data.get('bias_status', 'N/A')
+                        # 与 HistoryService 报告渲染同一护栏：dashboard 缺数据时是显式
+                        # null，dict.get 默认值不生效，直接插值会渲染出字面量 None。
                         report_lines.extend([
                             f"| {labels['price_metrics_label']} | {labels['current_price_label']} |",
                             "|---------|------|",
-                            f"| {labels['current_price_label']} | {price_data.get('current_price', 'N/A')} |",
-                            f"| {labels['ma5_label']} | {price_data.get('ma5', 'N/A')} |",
-                            f"| {labels['ma10_label']} | {price_data.get('ma10', 'N/A')} |",
-                            f"| {labels['ma20_label']} | {price_data.get('ma20', 'N/A')} |",
-                            f"| {labels['bias_ma5_label']} | {price_data.get('bias_ma5', 'N/A')}% {bias_status} |",
-                            f"| {labels['support_level_label']} | {price_data.get('support_level', 'N/A')} |",
-                            f"| {labels['resistance_level_label']} | {price_data.get('resistance_level', 'N/A')} |",
+                            f"| {labels['current_price_label']} | {display_value_or_na(price_data.get('current_price'))} |",
+                            f"| {labels['ma5_label']} | {display_value_or_na(price_data.get('ma5'))} |",
+                            f"| {labels['ma10_label']} | {display_value_or_na(price_data.get('ma10'))} |",
+                            f"| {labels['ma20_label']} | {display_value_or_na(price_data.get('ma20'))} |",
+                            f"| {labels['bias_ma5_label']} | {display_numeric_with_suffix(price_data.get('bias_ma5'), '%')} {display_value_or_na(bias_status)} |",
+                            f"| {labels['support_level_label']} | {display_value_or_na(price_data.get('support_level'))} |",
+                            f"| {labels['resistance_level_label']} | {display_value_or_na(price_data.get('resistance_level'))} |",
                             "",
                         ])
                     # 量能分析
                     if vol_data:
                         report_lines.extend([
-                            f"**{labels['volume_label']}**: {labels['volume_ratio_label']} {vol_data.get('volume_ratio', 'N/A')} ({vol_data.get('volume_status', '')}) | "
-                            f"{labels['turnover_rate_label']} {vol_data.get('turnover_rate', 'N/A')}%",
-                            f"💡 *{vol_data.get('volume_meaning', '')}*",
+                            f"**{labels['volume_label']}**: {labels['volume_ratio_label']} {display_value_or_na(vol_data.get('volume_ratio'))} ({display_value_or_na(vol_data.get('volume_status'))}) | "
+                            f"{labels['turnover_rate_label']} {display_numeric_with_suffix(vol_data.get('turnover_rate'), '%')}",
+                            f"💡 *{display_value_or_na(vol_data.get('volume_meaning'))}*",
                             "",
                         ])
                     # 筹码结构
@@ -1475,8 +1495,9 @@ class NotificationService(
                         else:
                             chip_health = localize_chip_health(chip_data.get('chip_health', 'N/A'), report_language)
                             report_lines.extend([
-                                f"**{labels['chip_label']}**: {chip_data.get('profit_ratio', 'N/A')} | {chip_data.get('avg_cost', 'N/A')} | "
-                                f"{chip_data.get('concentration', 'N/A')} {chip_health}",
+                                f"**{labels['chip_label']}**: {display_value_or_na(chip_data.get('profit_ratio'))} | "
+                                f"{display_value_or_na(chip_data.get('avg_cost'))} | "
+                                f"{display_value_or_na(chip_data.get('concentration'))} {display_value_or_na(chip_health)}",
                                 "",
                             ])
                     else:
@@ -1511,12 +1532,13 @@ class NotificationService(
                             "",
                         ])
                     # 仓位策略
-                    position = battle.get('position_strategy', {})
+                    raw_position = battle.get('position_strategy')
+                    position = raw_position if isinstance(raw_position, dict) else {}
                     if position:
                         report_lines.extend([
-                            f"**💰 {labels['suggested_position_label']}**: {position.get('suggested_position', 'N/A')}",
-                            f"- {labels['entry_plan_label']}: {position.get('entry_plan', 'N/A')}",
-                            f"- {labels['risk_control_label']}: {position.get('risk_control', 'N/A')}",
+                            f"**💰 {labels['suggested_position_label']}**: {display_value_or_na(position.get('suggested_position'))}",
+                            f"- {labels['entry_plan_label']}: {display_value_or_na(position.get('entry_plan'))}",
+                            f"- {labels['risk_control_label']}: {display_value_or_na(position.get('risk_control'))}",
                             "",
                         ])
                     # 检查清单
@@ -1527,7 +1549,7 @@ class NotificationService(
                             "",
                         ])
                         for item in checklist:
-                            report_lines.append(f"- {item}")
+                            report_lines.append(f"- {display_value_or_na(item)}")
                         report_lines.append("")
 
                 # ========== 信号归因分析 ==========
@@ -1683,9 +1705,12 @@ class NotificationService(
             for result in sorted_results:
                 signal_text, signal_emoji, _ = self._get_signal_level(result)
                 dashboard = result.dashboard if hasattr(result, 'dashboard') and result.dashboard else {}
-                core = dashboard.get('core_conclusion', {}) if dashboard else {}
-                battle = dashboard.get('battle_plan', {}) if dashboard else {}
-                intel = dashboard.get('intelligence', {}) if dashboard else {}
+                raw_core = dashboard.get('core_conclusion') if dashboard else None
+                core = raw_core if isinstance(raw_core, dict) else {}
+                raw_battle = dashboard.get('battle_plan') if dashboard else None
+                battle = raw_battle if isinstance(raw_battle, dict) else {}
+                raw_intel = dashboard.get('intelligence') if dashboard else None
+                intel = raw_intel if isinstance(raw_intel, dict) else {}
 
                 # 股票名称
                 stock_name = self._get_display_name(result, report_language)
@@ -1695,8 +1720,11 @@ class NotificationService(
                 lines.append("")
 
                 # 核心决策（一句话）
-                one_sentence = core.get('one_sentence', result.analysis_summary) if core else result.analysis_summary
-                if one_sentence:
+                one_sentence = display_value_or_na(
+                    core.get('one_sentence') if core else None,
+                    display_value_or_na(result.analysis_summary),
+                )
+                if one_sentence != "N/A":
                     lines.append(f"📌 **{one_sentence[:80]}**")
                     lines.append("")
                 # 重要信息区（舆情+基本面）
@@ -1723,7 +1751,7 @@ class NotificationService(
                 if risks:
                     lines.append(f"🚨 **{labels['risk_alerts_label']}**:")
                     for risk in risks[:2]:  # 最多显示2条
-                        risk_str = str(risk)
+                        risk_str = display_value_or_na(risk)
                         risk_text = risk_str[:50] + "..." if len(risk_str) > 50 else risk_str
                         lines.append(f"   • {risk_text}")
                     lines.append("")
@@ -1733,7 +1761,7 @@ class NotificationService(
                 if catalysts:
                     lines.append(f"✨ **{labels['positive_catalysts_label']}**:")
                     for cat in catalysts[:2]:  # 最多显示2条
-                        cat_str = str(cat)
+                        cat_str = display_value_or_na(cat)
                         cat_text = cat_str[:50] + "..." if len(cat_str) > 50 else cat_str
                         lines.append(f"   • {cat_text}")
                     lines.append("")
@@ -1741,30 +1769,32 @@ class NotificationService(
                 # 狙击点位
                 sniper = battle.get('sniper_points', {}) if battle else {}
                 if sniper:
-                    ideal_buy = str(sniper.get('ideal_buy', ''))
-                    stop_loss = str(sniper.get('stop_loss', ''))
-                    take_profit = str(sniper.get('take_profit', ''))
+                    ideal_buy = self._clean_sniper_value(sniper.get('ideal_buy'))
+                    stop_loss = self._clean_sniper_value(sniper.get('stop_loss'))
+                    take_profit = self._clean_sniper_value(sniper.get('take_profit'))
                     points = []
-                    if ideal_buy:
+                    if ideal_buy != "N/A":
                         points.append(f"🎯{labels['ideal_buy_label']}:{ideal_buy[:15]}")
-                    if stop_loss:
+                    if stop_loss != "N/A":
                         points.append(f"🛑{labels['stop_loss_label']}:{stop_loss[:15]}")
-                    if take_profit:
+                    if take_profit != "N/A":
                         points.append(f"🎊{labels['take_profit_label']}:{take_profit[:15]}")
                     if points:
                         lines.append(" | ".join(points))
                         lines.append("")
 
                 # 持仓建议
-                pos_advice = core.get('position_advice', {}) if core else {}
+                raw_pos_advice = core.get('position_advice') if core else None
+                pos_advice = raw_pos_advice if isinstance(raw_pos_advice, dict) else {}
                 if pos_advice:
-                    no_pos = str(pos_advice.get('no_position', ''))
-                    has_pos = str(pos_advice.get('has_position', ''))
+                    no_pos = display_value_or_na(pos_advice.get('no_position'), "")
+                    has_pos = display_value_or_na(pos_advice.get('has_position'), "")
                     if no_pos:
                         lines.append(f"🆕 {labels['no_position_label']}: {no_pos[:50]}")
                     if has_pos:
                         lines.append(f"💼 {labels['has_position_label']}: {has_pos[:50]}")
-                    lines.append("")
+                    if no_pos or has_pos:
+                        lines.append("")
 
                 # 多策略综合
                 strategy_synthesis = normalize_strategy_synthesis_payload(
@@ -1778,7 +1808,7 @@ class NotificationService(
                         f"{localize_consensus_level(strategy_synthesis.get('consensus_level', 'N/A'), report_language)} | "
                         f"{labels['strategy_conflict_label']} "
                         f"{localize_conflict_severity(strategy_synthesis.get('conflict_severity', 'none'), report_language)}"
-                        f"({strategy_synthesis.get('conflict_count', 0)})"
+                        f"({display_value_or_na(strategy_synthesis.get('conflict_count'))})"
                     )
                     invalid_count = strategy_invalid_opinion_count(strategy_synthesis)
                     if invalid_count:
@@ -1972,10 +2002,13 @@ class NotificationService(
         report_language = self._get_report_language(result)
         labels = get_report_labels(report_language)
         signal_text, signal_emoji, _ = self._get_signal_level(result)
-        dashboard = result.dashboard if hasattr(result, 'dashboard') and result.dashboard else {}
-        core = dashboard.get('core_conclusion', {}) if dashboard else {}
-        battle = dashboard.get('battle_plan', {}) if dashboard else {}
-        intel = dashboard.get('intelligence', {}) if dashboard else {}
+        dashboard = result.dashboard if hasattr(result, 'dashboard') and isinstance(result.dashboard, dict) else {}
+        raw_core = dashboard.get('core_conclusion') if dashboard else None
+        core = raw_core if isinstance(raw_core, dict) else {}
+        raw_battle = dashboard.get('battle_plan') if dashboard else None
+        battle = raw_battle if isinstance(raw_battle, dict) else {}
+        raw_intel = dashboard.get('intelligence') if dashboard else None
+        intel = raw_intel if isinstance(raw_intel, dict) else {}
 
         # 股票名称（转义 *ST 等特殊字符）
         stock_name = self._get_display_name(result, report_language)
@@ -1994,8 +2027,11 @@ class NotificationService(
         self._append_market_snapshot(lines, result)
 
         # 核心决策（一句话）
-        one_sentence = core.get('one_sentence', result.analysis_summary) if core else result.analysis_summary
-        if one_sentence:
+        one_sentence = display_value_or_na(
+            core.get('one_sentence') if core else None,
+            display_value_or_na(result.analysis_summary),
+        )
+        if one_sentence != "N/A":
             lines.extend([
                 f"### 📌 {labels['core_conclusion_heading']}",
                 "",
@@ -2036,7 +2072,7 @@ class NotificationService(
                 lines.append("")
                 lines.append(f"🚨 **{labels['risk_alerts_label']}**:")
                 for risk in risks[:3]:
-                    lines.append(f"- {str(risk)[:60]}")
+                    lines.append(f"- {display_value_or_na(risk)[:60]}")
 
             # 利好催化
             catalysts = intel.get('positive_catalysts', [])
@@ -2044,7 +2080,7 @@ class NotificationService(
                 lines.append("")
                 lines.append(f"✨ **{labels['positive_catalysts_label']}**:")
                 for cat in catalysts[:3]:
-                    lines.append(f"- {str(cat)[:60]}")
+                    lines.append(f"- {display_value_or_na(cat)[:60]}")
 
         if info_added:
             lines.append("")
@@ -2058,9 +2094,9 @@ class NotificationService(
                 f"| {labels['ideal_buy_label']} | {labels['stop_loss_label']} | {labels['take_profit_label']} |",
                 "|------|------|------|",
             ])
-            ideal_buy = sniper.get('ideal_buy', '-')
-            stop_loss = sniper.get('stop_loss', '-')
-            take_profit = sniper.get('take_profit', '-')
+            ideal_buy = self._clean_sniper_value(sniper.get('ideal_buy'))
+            stop_loss = self._clean_sniper_value(sniper.get('stop_loss'))
+            take_profit = self._clean_sniper_value(sniper.get('take_profit'))
             lines.append(f"| {ideal_buy} | {stop_loss} | {take_profit} |")
             lines.append("")
 
@@ -2096,13 +2132,16 @@ class NotificationService(
             lines.append("")
 
         # 持仓建议
-        pos_advice = core.get('position_advice', {}) if core else {}
+        raw_pos_advice = core.get('position_advice') if core else None
+        pos_advice = raw_pos_advice if isinstance(raw_pos_advice, dict) else {}
         if pos_advice:
             lines.extend([
                 f"### 💼 {labels['position_advice_heading']}",
                 "",
-                f"- 🆕 **{labels['no_position_label']}**: {pos_advice.get('no_position', self._get_display_operation_advice(result, report_language))}",
-                f"- 💼 **{labels['has_position_label']}**: {pos_advice.get('has_position', labels['continue_holding'])}",
+                f"- 🆕 **{labels['no_position_label']}**: "
+                f"{display_value_or_na(pos_advice.get('no_position'), self._get_display_operation_advice(result, report_language))}",
+                f"- 💼 **{labels['has_position_label']}**: "
+                f"{display_value_or_na(pos_advice.get('has_position'), labels['continue_holding'])}",
                 "",
             ])
 
@@ -2152,21 +2191,27 @@ class NotificationService(
             "",
             f"| {labels['close_label']} | {labels['prev_close_label']} | {labels['open_label']} | {labels['high_label']} | {labels['low_label']} | {labels['change_pct_label']} | {labels['change_amount_label']} | {labels['amplitude_label']} | {labels['volume_label']} | {labels['amount_label']} |",
             "|------|------|------|------|------|-------|-------|------|--------|--------|",
-            f"| {snapshot.get('close', 'N/A')} | {snapshot.get('prev_close', 'N/A')} | "
-            f"{snapshot.get('open', 'N/A')} | {snapshot.get('high', 'N/A')} | "
-            f"{snapshot.get('low', 'N/A')} | {snapshot.get('pct_chg', 'N/A')} | "
-            f"{snapshot.get('change_amount', 'N/A')} | {snapshot.get('amplitude', 'N/A')} | "
-            f"{snapshot.get('volume', 'N/A')} | {snapshot.get('amount', 'N/A')} |",
+            f"| {display_value_or_na(snapshot.get('close'))} | "
+            f"{display_value_or_na(snapshot.get('prev_close'))} | "
+            f"{display_value_or_na(snapshot.get('open'))} | "
+            f"{display_value_or_na(snapshot.get('high'))} | "
+            f"{display_value_or_na(snapshot.get('low'))} | "
+            f"{display_value_or_na(snapshot.get('pct_chg'))} | "
+            f"{display_value_or_na(snapshot.get('change_amount'))} | "
+            f"{display_value_or_na(snapshot.get('amplitude'))} | "
+            f"{display_value_or_na(snapshot.get('volume'))} | "
+            f"{display_value_or_na(snapshot.get('amount'))} |",
         ])
 
-        if "price" in snapshot:
-            display_source = self._get_source_display_name(snapshot.get('source', 'N/A'), report_language)
+        display_price = display_value_or_na(snapshot.get('price'))
+        if display_price != "N/A":
+            display_source = self._get_source_display_name(snapshot.get('source'), report_language)
             lines.extend([
                 "",
                 f"| {labels['current_price_label']} | {labels['volume_ratio_label']} | {labels['turnover_rate_label']} | {labels['source_label']} |",
                 "|-------|------|--------|----------|",
-                f"| {snapshot.get('price', 'N/A')} | {snapshot.get('volume_ratio', 'N/A')} | "
-                f"{snapshot.get('turnover_rate', 'N/A')} | {display_source} |",
+                f"| {display_price} | {display_value_or_na(snapshot.get('volume_ratio'))} | "
+                f"{display_value_or_na(snapshot.get('turnover_rate'))} | {display_source} |",
             ])
 
         lines.append("")
@@ -2190,7 +2235,7 @@ class NotificationService(
             amount = float(value)
         except (TypeError, ValueError):
             return "N/A"
-        if amount != amount:  # NaN
+        if not math.isfinite(amount):
             return "N/A"
         sign = "-" if amount < 0 else ""
         abs_amount = abs(amount)
@@ -2203,10 +2248,8 @@ class NotificationService(
 
     @staticmethod
     def _format_percent(value: Any) -> str:
-        try:
-            return f"{float(value):.2f}%"
-        except (TypeError, ValueError):
-            return "N/A"
+        numeric_value = _safe_float(value)
+        return f"{numeric_value:.2f}%" if numeric_value is not None else "N/A"
 
     @classmethod
     def _format_per_share(cls, value: Any, currency: Optional[str] = None) -> str:
@@ -2214,17 +2257,14 @@ class NotificationService(
             amount = float(value)
         except (TypeError, ValueError):
             return "N/A"
-        if amount != amount:  # NaN
+        if not math.isfinite(amount):
             return "N/A"
         suffix = cls._CURRENCY_SUFFIX.get((currency or "").upper(), "元")
         return f"{amount:.4f} {suffix}"
 
     @staticmethod
     def _format_text(value: Any) -> str:
-        if value is None:
-            return "N/A"
-        text = str(value).strip()
-        return text if text else "N/A"
+        return display_value_or_na(value)
 
     def _get_fundamental_blocks(self, result: AnalysisResult) -> Dict[str, Any]:
         """Extract financial_report / dividend / belong_boards / board rankings.
@@ -2401,7 +2441,7 @@ class NotificationService(
             amount = float(value)
         except (TypeError, ValueError):
             return "N/A"
-        if amount != amount:  # NaN
+        if not math.isfinite(amount):
             return "N/A"
         sign = "+" if amount > 0 else ("-" if amount < 0 else "")
         a = abs(amount)

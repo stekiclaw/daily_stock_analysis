@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from src.search_service import FinnhubNewsProvider
 
@@ -57,6 +58,7 @@ class TestSymbolGating:
             result = provider.search("q", stock_code="600519")
         get.assert_not_called()
         assert result.success is False
+        assert result.not_applicable is True
         assert result.results == []
         assert provider._key_errors["k"] == 0
 
@@ -153,6 +155,59 @@ class TestWindowAndDedup:
         with patch("src.search_service.requests.get", return_value=_response(payload)):
             result = provider.search("NVIDIA NVDA", max_results=10, stock_code="NVDA")
         assert [r.title for r in result.results] == ["Nvidia real"]
+
+
+class TestUtf8Decoding:
+    def test_json_boundary_forces_utf8_and_preserves_en_dash(self):
+        now = datetime.now(timezone.utc)
+        payload = [
+            _article(
+                "Microsoft margin seen at 10–12%",
+                summary="Guidance remains in the 10–12% range.",
+                when=now,
+            )
+        ]
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        response.headers["Content-Type"] = "application/json"
+        # Reproduce the bad boundary: without the provider override, requests
+        # would decode the UTF-8 bytes as Latin-1 and emit ``â``.
+        response.encoding = "ISO-8859-1"
+
+        provider = FinnhubNewsProvider(["k"])
+        with patch("src.search_service.requests.get", return_value=response):
+            result = provider.search(
+                "Microsoft Corporation MSFT latest news",
+                stock_code="MSFT",
+            )
+
+        assert result.success is True
+        assert result.results[0].title == "Microsoft margin seen at 10–12%"
+        assert "â" not in result.results[0].title
+        assert "â" not in result.results[0].snippet
+
+    def test_verified_upstream_punctuation_mojibake_is_repaired_selectively(self):
+        now = datetime.now(timezone.utc)
+        payload = [
+            _article(
+                "Microsoft dividend outlook",
+                summary=(
+                    "Microsoft may announce a 10â\x80\x9312% hikeâ\x80\x94"
+                    "why itâ\x80\x99s notable."
+                ),
+                when=now,
+            )
+        ]
+        provider = FinnhubNewsProvider(["k"])
+        with patch("src.search_service.requests.get", return_value=_response(payload)):
+            result = provider.search(
+                "Microsoft Corporation MSFT latest news",
+                stock_code="MSFT",
+            )
+
+        assert result.results[0].snippet == "Microsoft may announce a 10–12% hike—why it’s notable."
+        assert "â" not in result.results[0].snippet
 
 
 class TestErrorHandling:
@@ -258,6 +313,35 @@ class TestIntelligenceLayerPassesTheSymbol:
             request_days=3,
         )
 
+        assert provider.search.call_args.kwargs["stock_code"] == "MSFT"
+
+    def test_stock_news_entrypoint_also_passes_symbol_to_finnhub_capability(self):
+        from src.search_service import SearchResponse, SearchResult
+
+        service = self._service()
+        provider = MagicMock()
+        provider.supports_open_ended_queries = False
+        provider.name = "FinnhubNews"
+        provider.is_available = True
+        provider.search.return_value = SearchResponse(
+            query="Microsoft MSFT latest news",
+            provider="FinnhubNews",
+            success=True,
+            results=[
+                SearchResult(
+                    title="Microsoft announces verified update",
+                    snippet="Microsoft MSFT issued a company update.",
+                    url="https://example.com/msft",
+                    source="Example",
+                    published_date=datetime.now(timezone.utc).date().isoformat(),
+                )
+            ],
+        )
+        service._providers = [provider]
+
+        result = service.search_stock_news("MSFT", "Microsoft", max_results=1)
+
+        assert result.success is True
         assert provider.search.call_args.kwargs["stock_code"] == "MSFT"
 
     def test_web_search_provider_is_not_given_a_code(self):

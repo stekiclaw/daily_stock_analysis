@@ -502,6 +502,200 @@ class RunFlowTestCase(unittest.TestCase):
         self.assertIn("provider_run_started", {event.type for event in snapshot.events})
         self.assertIn("llm_run_started", {event.type for event in snapshot.events})
 
+    def test_active_provider_events_classify_unavailable_and_supplements(self) -> None:
+        flow_events: list[dict] = []
+        token = activate_run_diagnostic_context(
+            trace_id="trace-active-supplements",
+            task_id="task-active-supplements",
+            query_id="query-active-supplements",
+            stock_code="MSFT",
+            trigger_source="api",
+            event_sink=flow_events.append,
+        )
+        try:
+            record_provider_run(
+                data_type="realtime_quote",
+                provider="YfinanceFetcher",
+                operation="get_realtime_quote",
+                success=True,
+                record_count=1,
+            )
+            record_provider_run(
+                data_type="realtime_quote",
+                provider="LongbridgeFetcher",
+                operation="get_realtime_quote",
+                success=False,
+                error_type="unavailable",
+            )
+            record_provider_run(
+                data_type="realtime_quote",
+                provider="FinnhubFetcher",
+                operation="get_realtime_quote",
+                success=True,
+                record_count=1,
+            )
+            record_provider_run(
+                data_type="realtime_quote",
+                provider="AlphaVantageFetcher",
+                operation="get_realtime_quote",
+                success=False,
+                error_type="empty",
+                record_count=0,
+            )
+        finally:
+            reset_run_diagnostic_context(token)
+
+        snapshot = build_task_run_flow_snapshot(
+            TaskInfo(
+                task_id="task-active-supplements",
+                trace_id="trace-active-supplements",
+                stock_code="MSFT",
+                stock_name="Microsoft Corporation",
+                status=TaskStatus.PROCESSING,
+                created_at=datetime(2026, 8, 31, 6, 27, 0),
+                flow_events=flow_events,
+            )
+        )
+        nodes = {node.provider: node for node in snapshot.nodes if node.provider}
+
+        self.assertEqual(nodes["YfinanceFetcher"].status, "success")
+        self.assertEqual(nodes["LongbridgeFetcher"].status, "skipped")
+        self.assertEqual(nodes["FinnhubFetcher"].status, "success")
+        self.assertEqual(nodes["FinnhubFetcher"].metadata["role"], "supplement")
+        self.assertEqual(nodes["AlphaVantageFetcher"].status, "failed")
+        self.assertEqual(nodes["AlphaVantageFetcher"].metadata["role"], "supplement")
+        self.assertEqual(snapshot.summary.fallback_count, 0)
+        self.assertEqual(snapshot.summary.failed_attempts, 0)
+
+    def test_active_real_failure_then_skip_then_primary_success_is_fallback(self) -> None:
+        flow_events: list[dict] = []
+        token = activate_run_diagnostic_context(
+            trace_id="trace-active-real-fallback",
+            task_id="task-active-real-fallback",
+            query_id="query-active-real-fallback",
+            stock_code="MSFT",
+            trigger_source="api",
+            event_sink=flow_events.append,
+        )
+        try:
+            record_provider_run_started(
+                data_type="realtime_quote",
+                provider="PrimaryFetcher",
+                operation="get_realtime_quote",
+            )
+            record_provider_run(
+                data_type="realtime_quote",
+                provider="PrimaryFetcher",
+                operation="get_realtime_quote",
+                success=False,
+                error_type="ConnectionError",
+            )
+            record_provider_run_started(
+                data_type="realtime_quote",
+                provider="UnavailableFetcher",
+                operation="get_realtime_quote",
+            )
+            record_provider_run(
+                data_type="realtime_quote",
+                provider="UnavailableFetcher",
+                operation="get_realtime_quote",
+                success=False,
+                error_type="unavailable",
+            )
+            record_provider_run_started(
+                data_type="realtime_quote",
+                provider="FallbackFetcher",
+                operation="get_realtime_quote",
+            )
+            record_provider_run(
+                data_type="realtime_quote",
+                provider="FallbackFetcher",
+                operation="get_realtime_quote",
+                success=True,
+                record_count=1,
+            )
+        finally:
+            reset_run_diagnostic_context(token)
+
+        snapshot = build_task_run_flow_snapshot(
+            TaskInfo(
+                task_id="task-active-real-fallback",
+                trace_id="trace-active-real-fallback",
+                stock_code="MSFT",
+                stock_name="Microsoft Corporation",
+                status=TaskStatus.PROCESSING,
+                created_at=datetime(2026, 8, 31, 6, 27, 0),
+                flow_events=flow_events,
+            )
+        )
+        nodes = {node.provider: node for node in snapshot.nodes if node.provider}
+        edges = [edge.model_dump(by_alias=True) for edge in snapshot.edges]
+
+        self.assertEqual(nodes["PrimaryFetcher"].status, "failed")
+        self.assertEqual(nodes["UnavailableFetcher"].status, "skipped")
+        self.assertEqual(nodes["FallbackFetcher"].status, "fallback")
+        self.assertTrue(any(edge["kind"] == "fallback" for edge in edges))
+        self.assertEqual(snapshot.summary.fallback_count, 1)
+        self.assertEqual(snapshot.summary.failed_attempts, 1)
+
+    def test_active_repeated_provider_chain_counts_each_fallback(self) -> None:
+        flow_events: list[dict] = []
+        token = activate_run_diagnostic_context(
+            trace_id="trace-active-repeated-chain",
+            task_id="task-active-repeated-chain",
+            query_id="query-active-repeated-chain",
+            stock_code="MARKET",
+            trigger_source="api",
+            event_sink=flow_events.append,
+        )
+        try:
+            for _ in range(2):
+                record_provider_run_started(
+                    data_type="news_search",
+                    provider="PrimaryNews",
+                    operation="search_stock_news",
+                )
+                record_provider_run(
+                    data_type="news_search",
+                    provider="PrimaryNews",
+                    operation="search_stock_news",
+                    success=False,
+                    error_type="NoUsableNews",
+                )
+                record_provider_run_started(
+                    data_type="news_search",
+                    provider="FallbackNews",
+                    operation="search_stock_news",
+                )
+                record_provider_run(
+                    data_type="news_search",
+                    provider="FallbackNews",
+                    operation="search_stock_news",
+                    success=True,
+                    record_count=2,
+                )
+        finally:
+            reset_run_diagnostic_context(token)
+
+        snapshot = build_task_run_flow_snapshot(
+            TaskInfo(
+                task_id="task-active-repeated-chain",
+                trace_id="trace-active-repeated-chain",
+                stock_code="MARKET",
+                stock_name="大盘复盘",
+                status=TaskStatus.PROCESSING,
+                created_at=datetime(2026, 8, 31, 6, 27, 0),
+                flow_events=flow_events,
+            )
+        )
+        fallback_nodes = [
+            node for node in snapshot.nodes if node.provider == "FallbackNews"
+        ]
+
+        self.assertEqual([node.status for node in fallback_nodes], ["fallback", "fallback"])
+        self.assertEqual(snapshot.summary.fallback_count, 2)
+        self.assertEqual(snapshot.summary.failed_attempts, 2)
+
     def test_active_chip_started_event_updates_same_provider_node(self) -> None:
         flow_events: list[dict] = []
         token = activate_run_diagnostic_context(
@@ -703,6 +897,202 @@ class RunFlowTestCase(unittest.TestCase):
         self.assertEqual(quote_node.ended_at, "2026-06-08T10:00:01")
         self.assertIn("history_run", {event.type for event in snapshot.events})
         self.assertIn("notification_run", {event.type for event in snapshot.events})
+
+    def test_primary_success_then_supplements_and_unavailable_are_not_fallback(self) -> None:
+        context_snapshot = {
+            "diagnostics": {
+                "trace_id": "trace-us-supplement",
+                "provider_runs": [
+                    {
+                        "data_type": "realtime_quote",
+                        "provider": "YfinanceFetcher",
+                        "success": True,
+                        "record_count": 1,
+                        "created_at": "2026-08-31T06:27:01",
+                    },
+                    {
+                        "data_type": "realtime_quote",
+                        "provider": "LongbridgeFetcher",
+                        "success": False,
+                        "error_type": "unavailable",
+                        "created_at": "2026-08-31T06:27:02",
+                    },
+                    {
+                        "data_type": "realtime_quote",
+                        "provider": "FinnhubFetcher",
+                        "success": True,
+                        "record_count": 1,
+                        "created_at": "2026-08-31T06:27:03",
+                    },
+                    {
+                        "data_type": "realtime_quote",
+                        "provider": "AlphaVantageFetcher",
+                        "success": False,
+                        "error_type": "empty",
+                        "record_count": 0,
+                        "created_at": "2026-08-31T06:27:04",
+                    },
+                ],
+                "llm_runs": [],
+                "history_runs": [],
+                "notification_runs": [],
+            },
+            "analysis_context_pack_overview": _overview(
+                blocks=[
+                    {
+                        "key": "quote",
+                        "label": "行情",
+                        "status": "available",
+                        "source": "yfinance",
+                        "warnings": [],
+                        "missing_reasons": [],
+                    },
+                    {
+                        "key": "chip",
+                        "label": "筹码",
+                        "status": "not_supported",
+                        "source": None,
+                        "warnings": [],
+                        "missing_reasons": ["chip_not_supported"],
+                    },
+                ]
+            ),
+        }
+
+        snapshot = build_history_run_flow_snapshot(_history_record(context_snapshot=context_snapshot))
+        nodes = {node.provider: node for node in snapshot.nodes if node.kind == "data_source" and node.provider}
+        edges = [edge.model_dump(by_alias=True) for edge in snapshot.edges]
+
+        self.assertEqual(nodes["YfinanceFetcher"].status, "success")
+        self.assertEqual(nodes["YfinanceFetcher"].metadata["role"], "primary")
+        self.assertEqual(nodes["LongbridgeFetcher"].status, "skipped")
+        self.assertEqual(nodes["LongbridgeFetcher"].metadata["role"], "supplement")
+        self.assertEqual(nodes["FinnhubFetcher"].status, "success")
+        self.assertEqual(nodes["FinnhubFetcher"].metadata["role"], "supplement")
+        self.assertEqual(nodes["AlphaVantageFetcher"].status, "failed")
+        self.assertEqual(nodes["AlphaVantageFetcher"].metadata["role"], "supplement")
+        self.assertFalse(any(edge["kind"] == "fallback" for edge in edges))
+        self.assertEqual(snapshot.summary.fallback_count, 0)
+        self.assertEqual(snapshot.summary.failed_attempts, 0)
+        self.assertEqual(snapshot.status, "success")
+
+    def test_real_failure_then_skip_then_primary_success_keeps_fallback_edge(self) -> None:
+        context_snapshot = {
+            "diagnostics": {
+                "trace_id": "trace-real-fallback-after-skip",
+                "provider_runs": [
+                    {
+                        "data_type": "realtime_quote",
+                        "provider": "PrimaryFetcher",
+                        "success": False,
+                        "error_type": "ConnectionError",
+                        "created_at": "2026-08-31T06:27:01",
+                    },
+                    {
+                        "data_type": "realtime_quote",
+                        "provider": "UnavailableFetcher",
+                        "success": False,
+                        "error_type": "unavailable",
+                        "created_at": "2026-08-31T06:27:02",
+                    },
+                    {
+                        "data_type": "realtime_quote",
+                        "provider": "FallbackFetcher",
+                        "success": True,
+                        "record_count": 1,
+                        "created_at": "2026-08-31T06:27:03",
+                    },
+                ],
+                "llm_runs": [],
+                "history_runs": [],
+                "notification_runs": [],
+            },
+            "analysis_context_pack_overview": _overview(blocks=[]),
+        }
+
+        snapshot = build_history_run_flow_snapshot(
+            _history_record(context_snapshot=context_snapshot)
+        )
+        nodes = {
+            node.provider: node
+            for node in snapshot.nodes
+            if node.kind == "data_source" and node.provider
+        }
+        edges = [edge.model_dump(by_alias=True) for edge in snapshot.edges]
+
+        self.assertEqual(nodes["PrimaryFetcher"].status, "failed")
+        self.assertEqual(nodes["UnavailableFetcher"].status, "skipped")
+        self.assertEqual(nodes["FallbackFetcher"].status, "fallback")
+        self.assertTrue(any(edge["kind"] == "fallback" for edge in edges))
+        self.assertEqual(snapshot.summary.fallback_count, 1)
+        self.assertEqual(snapshot.summary.failed_attempts, 1)
+
+    def test_repeated_provider_chain_starts_a_new_primary_sequence(self) -> None:
+        context_snapshot = {
+            "diagnostics": {
+                "trace_id": "trace-repeated-provider-chain",
+                "provider_runs": [
+                    {
+                        "data_type": "news_search",
+                        "provider": "PrimaryNews",
+                        "success": False,
+                        "error_type": "NoUsableNews",
+                        "created_at": "2026-08-31T06:27:01",
+                    },
+                    {
+                        "data_type": "news_search",
+                        "provider": "FallbackNews",
+                        "success": True,
+                        "record_count": 2,
+                        "created_at": "2026-08-31T06:27:02",
+                    },
+                    {
+                        "data_type": "news_search",
+                        "provider": "PrimaryNews",
+                        "success": False,
+                        "error_type": "NoUsableNews",
+                        "created_at": "2026-08-31T06:27:03",
+                    },
+                    {
+                        "data_type": "news_search",
+                        "provider": "FallbackNews",
+                        "success": True,
+                        "record_count": 2,
+                        "created_at": "2026-08-31T06:27:04",
+                    },
+                ],
+                "llm_runs": [],
+                "history_runs": [],
+                "notification_runs": [],
+            },
+            "analysis_context_pack_overview": _overview(
+                blocks=[
+                    {
+                        "key": "news",
+                        "label": "新闻",
+                        "status": "available",
+                        "source": "FallbackNews",
+                        "warnings": [],
+                        "missing_reasons": [],
+                    }
+                ]
+            ),
+        }
+
+        snapshot = build_history_run_flow_snapshot(
+            _history_record(context_snapshot=context_snapshot)
+        )
+        fallback_nodes = [
+            node
+            for node in snapshot.nodes
+            if node.provider == "FallbackNews" and node.id.startswith("provider_")
+        ]
+        fallback_edges = [edge for edge in snapshot.edges if edge.kind == "fallback"]
+
+        self.assertEqual([node.status for node in fallback_nodes], ["fallback", "fallback"])
+        self.assertEqual(snapshot.summary.fallback_count, 2)
+        self.assertEqual(snapshot.summary.failed_attempts, 2)
+        self.assertEqual(len(fallback_edges), 2)
 
     def test_provider_fallback_maps_to_nodes_edges_and_warning_events(self) -> None:
         context_snapshot = {

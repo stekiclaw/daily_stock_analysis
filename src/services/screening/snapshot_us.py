@@ -16,6 +16,8 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 
+from data_provider.yfinance_fetcher import _resolve_yfinance_pb_ratio
+
 logger = logging.getLogger(__name__)
 
 _SP500_WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -201,7 +203,7 @@ def _enrich_info_fields(df: pd.DataFrame) -> None:
             if pd.isna(df.at[idx, "pe_ratio"]) or df.at[idx, "pe_ratio"] == 0:
                 df.at[idx, "pe_ratio"] = info.get("trailingPE")
             if pd.isna(df.at[idx, "pb_ratio"]) or df.at[idx, "pb_ratio"] == 0:
-                df.at[idx, "pb_ratio"] = info.get("priceToBook")
+                df.at[idx, "pb_ratio"] = _resolve_yfinance_pb_ratio(info)
             if not df.at[idx, "industry"]:
                 df.at[idx, "industry"] = info.get("industry", "")
             if not df.at[idx, "name"] or df.at[idx, "name"] == ticker:
