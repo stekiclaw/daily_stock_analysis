@@ -10,6 +10,7 @@ import {
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { UiLanguageProvider, useUiLanguage } from './contexts/UiLanguageContext';
 import { useAgentChatStore } from './stores/agentChatStore';
+import { APP_BASE_PATH } from './utils/constants';
 import './App.css';
 
 const HomePage = lazy(() => import('./pages/HomePage'));
@@ -97,7 +98,7 @@ const AppContent: React.FC = () => {
 const App: React.FC = () => {
   return (
     <UiLanguageProvider>
-      <Router>
+      <Router basename={APP_BASE_PATH === '/' ? undefined : APP_BASE_PATH}>
         <AuthProvider>
           <AppContent />
         </AuthProvider>

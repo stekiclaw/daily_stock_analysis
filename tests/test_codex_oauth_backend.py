@@ -140,21 +140,120 @@ def test_saved_credential_is_owner_only(tmp_path):
     assert oct(os.stat(path).st_mode & 0o777) == "0o600"
 
 
+class _TokenResponse:
+    """Stand-in for the OAuth token endpoint's JSON response."""
+
+    def __init__(self, access_token):
+        self.status_code = 200
+        self.text = ""
+        self._access_token = access_token
+
+    def json(self):
+        return {
+            "access_token": self._access_token,
+            "refresh_token": f"rotated-for-{self._access_token}",
+            "expires_in": 3600,
+        }
+
+
+def _patch_token_endpoint(monkeypatch, calls):
+    def fake_post(url, **kwargs):
+        assert url == codex_oauth.OAUTH_TOKEN_URL
+        calls.append((kwargs.get("data") or {}).get("refresh_token"))
+        return _TokenResponse(f"refreshed-{len(calls)}.token.sig")
+
+    monkeypatch.setattr(codex_oauth.requests, "post", fake_post)
+
+
 def test_expired_credential_triggers_refresh(monkeypatch, tmp_path):
     path = tmp_path / "auth.json"
     path.write_text(json.dumps(_credential(expires_at=time.time() - 10)), encoding="utf-8")
     calls = []
+    _patch_token_endpoint(monkeypatch, calls)
 
-    def fake_refresh(credential, auth_path):
-        calls.append(auth_path)
-        return _credential(access_token="refreshed.token.sig")
-
-    monkeypatch.setattr(codex_oauth, "refresh_credential", fake_refresh)
     result = codex_oauth.ensure_fresh_credential(
         codex_oauth.load_credential(str(path)), str(path)
     )
-    assert calls == [str(path)]
-    assert result["access_token"] == "refreshed.token.sig"
+
+    assert calls == ["rt.test"]
+    assert result["access_token"] == "refreshed-1.token.sig"
+    # The rotated pair is persisted, or the next process would replay a dead token.
+    assert json.loads(path.read_text())["access_token"] == "refreshed-1.token.sig"
+
+
+def test_expired_credential_reuses_a_refresh_another_worker_already_did(monkeypatch, tmp_path):
+    """OpenAI rotates the refresh token, so a second rotation kills the first."""
+    path = tmp_path / "auth.json"
+    path.write_text(json.dumps(_credential(access_token="fresh.token.sig")), encoding="utf-8")
+    calls = []
+    _patch_token_endpoint(monkeypatch, calls)
+
+    stale = _credential(access_token="stale.token.sig", expires_at=time.time() - 10)
+    result = codex_oauth.ensure_fresh_credential(stale, str(path))
+
+    assert calls == []
+    assert result["access_token"] == "fresh.token.sig"
+
+
+def test_forced_refresh_reuses_a_newer_credential_from_disk(monkeypatch, tmp_path):
+    path = tmp_path / "auth.json"
+    path.write_text(json.dumps(_credential(access_token="fresh.token.sig")), encoding="utf-8")
+    calls = []
+    _patch_token_endpoint(monkeypatch, calls)
+
+    stale = _credential(access_token="stale.token.sig")
+    result = codex_oauth.refresh_credential(stale, str(path))
+
+    assert calls == []
+    assert result["access_token"] == "fresh.token.sig"
+
+
+def test_concurrent_expiry_rotates_the_token_exactly_once(monkeypatch, tmp_path):
+    import threading
+
+    path = tmp_path / "auth.json"
+    path.write_text(json.dumps(_credential(expires_at=time.time() - 10)), encoding="utf-8")
+    calls = []
+    lock = threading.Lock()
+
+    def fake_post(url, **kwargs):
+        with lock:
+            calls.append((kwargs.get("data") or {}).get("refresh_token"))
+            index = len(calls)
+        # Hold long enough that an unserialized implementation would let a
+        # second worker in with the same (already spent) refresh token.
+        time.sleep(0.05)
+        return _TokenResponse(f"refreshed-{index}.token.sig")
+
+    monkeypatch.setattr(codex_oauth.requests, "post", fake_post)
+
+    barrier = threading.Barrier(4)
+    results = [None] * 4
+
+    def worker(index):
+        barrier.wait()
+        results[index] = codex_oauth.ensure_fresh_credential(
+            codex_oauth.load_credential(str(path)), str(path)
+        )
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert calls == ["rt.test"]
+    assert {r["access_token"] for r in results} == {"refreshed-1.token.sig"}
+
+
+def test_credential_write_leaves_no_temp_file_and_stays_owner_only(tmp_path):
+    path = tmp_path / "auth.json"
+    codex_oauth.save_credential(str(path), _credential())
+
+    assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+    # The temp file is unique per write and lands in the same directory, so an
+    # interrupted write can never be mistaken for the credential itself.
+    assert [p.name for p in tmp_path.glob(".auth.json.*")] == []
 
 
 # --- request construction ---------------------------------------------------

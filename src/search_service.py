@@ -266,6 +266,7 @@ class SearchResponse:
     success: bool = True
     error_message: Optional[str] = None
     search_time: float = 0.0  # 搜索耗时（秒）
+    not_applicable: bool = False  # provider 对当前标的结构性不适用，不是请求失败
     
     def to_context(self, max_results: int = 5) -> str:
         """将搜索结果转换为可用于 AI 分析的上下文"""
@@ -2225,6 +2226,267 @@ class SearXNGSearchProvider(BaseSearchProvider):
         )
 
 
+# Boilerplate the intelligence layer appends to every query, plus corporate-form
+# suffixes shared by unrelated issuers. Matching on these would mark most of a
+# wire feed "relevant" and defeat the ranking.
+_GENERIC_ISSUER_TERMS = frozenset({
+    "LATEST", "NEWS", "EVENTS", "ANALYST", "RATING", "TARGET", "PRICE",
+    "REPORT", "EARNINGS", "REVENUE", "PROFIT", "GROWTH", "FORECAST",
+    "INDUSTRY", "COMPETITORS", "MARKET", "SHARE", "OUTLOOK", "RISK",
+    "INSIDER", "SELLING", "LAWSUIT", "LITIGATION", "STOCK", "SHARES",
+    "INC", "CORP", "CORPORATION", "LTD", "LIMITED", "PLC", "GROUP",
+    "HOLDINGS", "COMPANY", "THE", "AND", "FOR", "ADR", "CLASS",
+})
+
+
+def _issuer_relevance_terms(text: str, symbol: str) -> List[str]:
+    """Terms that mark an article as being about *this* issuer.
+
+    Symbol-scoped news feeds are per-issuer in name only - a meaningful share
+    of what they return is same-day general market wire that merely ran
+    alongside. Callers pass whatever names the issuer (an analysis query
+    carrying the company's display name, or an ETF holding's name).
+    """
+    terms = [symbol.upper()] if symbol else []
+    for raw in re.findall(r"[A-Za-z][A-Za-z.&-]*", text or ""):
+        term = raw.upper().strip(".&-")
+        if len(term) < 3 or term in _GENERIC_ISSUER_TERMS or term in terms:
+            continue
+        terms.append(term)
+    return terms
+
+
+def _mentions_issuer(text: str, terms: List[str]) -> bool:
+    for term in terms:
+        if re.search(rf"\b{re.escape(term)}\b", text):
+            return True
+    return False
+
+
+# Verified against Finnhub's raw UTF-8 JSON on 2026-08-31: some upstream
+# summaries already contain UTF-8 punctuation bytes decoded as Latin-1 code
+# points (for example ``10â\x80\x9312%``).  Fix only this explicit punctuation
+# whitelist; do not round-trip arbitrary Unicode text, which could corrupt valid
+# company names and non-English reporting.
+_FINNHUB_MOJIBAKE_REPLACEMENTS = {
+    "â\x80\x93": "–",
+    "â\x80\x94": "—",
+    "â\x80\x98": "‘",
+    "â\x80\x99": "’",
+    "â\x80\x9c": "“",
+    "â\x80\x9d": "”",
+    "â\x80\xa6": "…",
+    "Â\xa0": " ",
+}
+
+
+def _normalize_finnhub_text(value: Any) -> str:
+    text = str(value or "").strip()
+    for corrupted, repaired in _FINNHUB_MOJIBAKE_REPLACEMENTS.items():
+        if corrupted in text:
+            text = text.replace(corrupted, repaired)
+    return text
+
+
+class FinnhubNewsProvider(BaseSearchProvider):
+    """Ticker-scoped company news from Finnhub's ``/company-news`` endpoint.
+
+    Like :class:`YFinanceNewsProvider` this is a symbol lookup rather than a
+    web search, so it cannot answer open-ended intelligence queries. It earns
+    its place ahead of the Yahoo fallback on volume: a three-day window for a
+    liquid US name returns on the order of a hundred articles where Yahoo
+    returns six, which is the difference between the model reasoning over a
+    real news set and reasoning over a single headline.
+
+    Note this endpoint is on Finnhub's free tier even though ``/stock/candle``
+    (used by :class:`~data_provider.finnhub_fetcher.FinnhubFetcher` for daily
+    bars) is not - a 403 there says nothing about news access, so the two must
+    not be gated on each other.
+
+    Coverage is US-first; the endpoint accepts only plain exchange tickers, so
+    non-US symbols are declined up front rather than sent and failed.
+    """
+
+    BASE_URL = "https://finnhub.io/api/v1/company-news"
+    supports_open_ended_queries = False
+
+    def __init__(self, api_keys: List[str]) -> None:
+        super().__init__(api_keys, "FinnhubNews")
+
+    def search(
+        self,
+        query: str,
+        max_results: int = 5,
+        days: int = 7,
+        stock_code: Optional[str] = None,
+        region: Optional[str] = None,
+    ) -> SearchResponse:
+        symbol = self._resolve_symbol(stock_code)
+        if not symbol:
+            # Not a provider failure - this source does not cover this code.
+            # Returning early keeps it out of the key error accounting, which
+            # exists for real fetch failures.
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"{self._name} 不支持从 '{stock_code}' 解析出美股代码",
+                not_applicable=True,
+            )
+        return self._execute_search(
+            query,
+            max_results=max_results,
+            days=days,
+            symbol=symbol,
+        )
+
+    @staticmethod
+    def _resolve_symbol(stock_code: Optional[str]) -> str:
+        """Return the plain US ticker this endpoint accepts, else ''."""
+        code = (stock_code or "").strip().upper()
+        if not code:
+            return ""
+        try:
+            from data_provider.us_index_mapping import is_us_stock_code
+        except Exception:  # pragma: no cover - defensive
+            return ""
+        return code if is_us_stock_code(code) else ""
+
+    # Shared with ETFConstituentNewsProvider: both consume per-issuer feeds
+    # that carry unrelated same-day wire.
+    _relevance_terms = staticmethod(_issuer_relevance_terms)
+    _mentions = staticmethod(_mentions_issuer)
+
+    @staticmethod
+    def _parse_published(raw: Any) -> Optional[datetime]:
+        """Finnhub timestamps are epoch seconds (UTC)."""
+        try:
+            ts = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if ts <= 0:
+            return None
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    def _do_search(
+        self,
+        query: str,
+        api_key: str,
+        max_results: int,
+        days: int = 7,
+        symbol: str = "",
+    ) -> SearchResponse:
+        window_days = max(1, days)
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=window_days)
+        params = {
+            "symbol": symbol,
+            # The endpoint filters on calendar dates, so it needs the window's
+            # start date; the precise cutoff is re-applied per item below.
+            "from": cutoff.strftime("%Y-%m-%d"),
+            "to": now.strftime("%Y-%m-%d"),
+            "token": api_key,
+        }
+
+        try:
+            response = requests.get(self.BASE_URL, params=params, timeout=15)
+        except requests.RequestException as exc:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"请求失败: {exc}",
+            )
+
+        if response.status_code != 200:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"HTTP {response.status_code}: {response.text[:200]}",
+            )
+
+        try:
+            # Finnhub JSON is UTF-8.  Do not let requests fall back to a legacy
+            # text encoding when the server omits/misstates charset, otherwise a
+            # real en dash becomes mojibake such as ``â`` in model evidence.
+            response.encoding = "utf-8"
+            payload = response.json()
+        except ValueError:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message="响应不是有效 UTF-8 JSON",
+            )
+        if not isinstance(payload, list):
+            # The endpoint answers quota/permission problems with an object
+            # carrying an ``error`` field rather than a non-200 status.
+            detail = ""
+            if isinstance(payload, dict):
+                detail = str(payload.get("error") or payload)[:200]
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"响应格式异常: {detail}",
+            )
+
+        terms = self._relevance_terms(query, symbol)
+        ranked: List[tuple] = []
+        seen_urls: set = set()
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            published = self._parse_published(item.get("datetime"))
+            if published is not None and published < cutoff:
+                continue
+            url = str(item.get("url") or "").strip()
+            if url:
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+            title = _normalize_finnhub_text(item.get("headline"))
+            if not title:
+                continue
+            snippet = _normalize_finnhub_text(item.get("summary"))
+            about_issuer = self._mentions(f"{title} {snippet}".upper(), terms)
+            ranked.append((
+                about_issuer,
+                published.isoformat() if published is not None else "",
+                SearchResult(
+                    title=title,
+                    snippet=snippet,
+                    url=url,
+                    source=str(item.get("source") or "").strip() or "Finnhub",
+                    published_date=(
+                        published.isoformat() if published is not None else None
+                    ),
+                ),
+            ))
+
+        # Issuer-specific first, then newest. The endpoint neither orders its
+        # response nor guarantees the feed is actually about the symbol, and
+        # the caller truncates to max_results - so ranking on recency alone
+        # would spend the whole budget on same-day general market wire.
+        ranked.sort(key=lambda row: (row[0], row[1]), reverse=True)
+        results = [row[2] for row in ranked]
+        return SearchResponse(
+            query=query,
+            results=results[:max_results],
+            provider=self._name,
+            success=True,
+        )
+
+
 class YFinanceNewsProvider(BaseSearchProvider):
     """Ticker-scoped headlines from Yahoo Finance.
 
@@ -2279,6 +2541,7 @@ class YFinanceNewsProvider(BaseSearchProvider):
                 provider=self._name,
                 success=False,
                 error_message=f"{self._name} 无法从 '{stock_code}' 解析出 Yahoo 代码",
+                not_applicable=True,
             )
         return self._execute_search(
             query,
@@ -2389,6 +2652,228 @@ class YFinanceNewsProvider(BaseSearchProvider):
         )
 
 
+class ETFConstituentNewsProvider(BaseSearchProvider):
+    """News for an ETF's largest holdings, used when the fund itself has none.
+
+    A thinly-covered or leveraged ETF rarely generates news under its own
+    ticker - SOXS's most recent Yahoo headline was 29 days old against a
+    3-day analysis window, so every fund-level source correctly returned
+    nothing. But an ETF's price is driven by its constituents, so their news
+    is the news that actually explains the move; a human analyst looking at a
+    semiconductor ETF reads semiconductor company news.
+
+    Placed last in the chain, so it only fires when the fund-level sources
+    (Finnhub/Yahoo) came back empty - real fund news is always preferred.
+    Needs no API key.
+
+    Results are attributed to the holding they came from, so downstream
+    relevance scoring sees them for what they are: background/driver news for
+    the fund, not announcements by the fund.
+    """
+
+    supports_open_ended_queries = False
+    # Cost bound: one holdings lookup plus one news lookup per constituent.
+    MAX_CONSTITUENTS = 5
+    # Cash-collateral and money-market positions carry no equity news. Leveraged
+    # and inverse funds hold swaps, so these are often *all* they report, which
+    # is why such a fund legitimately yields no constituent news at all.
+    #
+    # Matched on word boundaries, because a false positive is worse than the
+    # false negative it prevents: dropping a real holding silently removes the
+    # very signal this provider exists to supply, while keeping one only costs
+    # a news lookup that comes back empty. Plain substring matching got this
+    # wrong on live data - "CASH" matched FirstCash Holdings (held by IWO) and
+    # "DEPOSIT" matched Light & Wonder's "Chess Depository Interest" (BETZ),
+    # and it would match any "American Depositary Receipt" name too.
+    #
+    # For the same reason every term is a money-fund phrase rather than a bare
+    # word: "MONEY" alone matches MoneyLion/MoneyHero/Money Forward, "BILL"
+    # matches BILL Holdings, "TRUST" matches Northern Trust and Digital Realty
+    # Trust, "GOV" matches Easterly Government Properties, and "INST" matches
+    # Texas Instruments.
+    _CASH_HOLDING_PATTERN = re.compile(
+        r"\b(?:"
+        r"CASH"
+        r"|TREASURY|TREASURIES"
+        # Money funds, including names that say "Money" without "Market"
+        # ("Invesco Premier US Government Money Inst") or abbreviate it
+        # ("JPMorgan US Government MMkt IM"). Those two are caught today only
+        # by the five-letter XX ticker below; a money-market *ETF* share class
+        # (IQMM, SBIL) has no such ticker to fall back on.
+        r"|MONEY\s+(?:MARKET|MKT)|MMKT"
+        r"|(?:GOVT|GOVERNMENT)\s+MONEY"
+        # "Government Obligs X", "Treasury Obligations"
+        r"|(?:GOVT|GOVERNMENT|TREASURY)\s+OBLIG\w*"
+        r"|LIQUIDITY"
+        r"|REPOS?"
+        r"|DEPOSITS?"
+        # T-bill funds are the collateral sleeve of 0DTE covered-call ETFs:
+        # XDTE/QDTE/RDTE report only "Roundhill Weekly T-Bill ETF" (5-7%) plus
+        # a government money fund, and MSTU reports "The Laddered T-Bill ETF".
+        # WEEK/TLDR are four-letter tickers, so only the name identifies them.
+        r"|T-BILLS?"
+        r")\b"
+    )
+
+    def __init__(self) -> None:
+        # No credential to rotate; the base class only needs a non-empty pool.
+        super().__init__(["etf-constituents"], "ETFConstituentNews")
+
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    @classmethod
+    def _is_cash_like(cls, symbol: str, name: str) -> bool:
+        if cls._CASH_HOLDING_PATTERN.search((name or "").upper()):
+            return True
+        # US mutual-fund/money-market tickers are five letters ending in XX
+        # (DIRXX, FGXXX); listed equities never take that form.
+        ticker = (symbol or "").strip().upper()
+        return len(ticker) == 5 and ticker.isalpha() and ticker.endswith("XX")
+
+    def _resolve_constituents(self, stock_code: str) -> List[tuple]:
+        """Return ``[(symbol, name), ...]`` for the fund's top equity holdings."""
+        code = (stock_code or "").strip().upper()
+        if not code:
+            return []
+        try:
+            import yfinance as yf
+
+            holdings = yf.Ticker(code).funds_data.top_holdings
+        except Exception as exc:
+            # Not an ETF, or Yahoo has no fund data for it. Either way this
+            # source does not apply - it is not a fetch failure.
+            logger.debug("[%s] %s 无法获取持仓: %s", self._name, code, exc)
+            return []
+        if holdings is None or getattr(holdings, "empty", True):
+            return []
+
+        resolved: List[tuple] = []
+        for symbol, row in holdings.iterrows():
+            try:
+                name = str(row.get("Name") or "")
+            except Exception:
+                name = ""
+            ticker = str(symbol).strip()
+            if not ticker or self._is_cash_like(ticker, name):
+                continue
+            resolved.append((ticker, name))
+            if len(resolved) >= self.MAX_CONSTITUENTS:
+                break
+        return resolved
+
+    def search(
+        self,
+        query: str,
+        max_results: int = 5,
+        days: int = 7,
+        stock_code: Optional[str] = None,
+        region: Optional[str] = None,
+    ) -> SearchResponse:
+        constituents = self._resolve_constituents(stock_code or "")
+        if not constituents:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"{self._name} 无法解析 '{stock_code}' 的成分股（非 ETF 或仅持有现金类资产）",
+                not_applicable=True,
+            )
+        return self._execute_search(
+            query,
+            max_results=max_results,
+            days=days,
+            constituents=constituents,
+        )
+
+    def _do_search(
+        self,
+        query: str,
+        api_key: str,
+        max_results: int,
+        days: int = 7,
+        constituents: Optional[List[tuple]] = None,
+    ) -> SearchResponse:
+        constituents = list(constituents or [])
+        try:
+            import yfinance as yf
+        except ImportError:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message="yfinance 未安装",
+            )
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, days))
+        ranked: List[tuple] = []
+        seen_urls: set = set()
+
+        for ticker, holding_name in constituents:
+            try:
+                items = yf.Ticker(ticker).news or []
+            except Exception as exc:
+                logger.debug("[%s] 成分股 %s 拉取新闻失败: %s", self._name, ticker, exc)
+                continue
+
+            # A holding's Yahoo feed carries unrelated market wire too, so rank
+            # articles that actually concern the holding above ones that merely
+            # appeared in its feed - otherwise max_results is spent on noise.
+            terms = _issuer_relevance_terms(holding_name, ticker)
+
+            for item in items:
+                content = item.get("content") if isinstance(item, dict) else None
+                if not isinstance(content, dict):
+                    continue
+                published = YFinanceNewsProvider._parse_published(content.get("pubDate"))
+                if published is not None and published < cutoff:
+                    continue
+                url = ""
+                for key in ("canonicalUrl", "clickThroughUrl"):
+                    candidate = content.get(key)
+                    if isinstance(candidate, dict) and candidate.get("url"):
+                        url = str(candidate["url"])
+                        break
+                if url:
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                title = str(content.get("title") or "").strip()
+                if not title:
+                    continue
+                label = holding_name.strip() or ticker
+                snippet = str(content.get("summary") or "").strip()
+                about_holding = _mentions_issuer(f"{title} {snippet}".upper(), terms)
+                ranked.append((
+                    about_holding,
+                    published.isoformat() if published is not None else "",
+                    SearchResult(
+                        title=title,
+                        snippet=snippet,
+                        url=url,
+                        # Attribution names the holding, so a reader (and the
+                        # model) can tell this is constituent news rather than
+                        # something the fund itself announced.
+                        source=f"成分股 {ticker}（{label}）",
+                        published_date=(
+                            published.isoformat() if published is not None else None
+                        ),
+                    ),
+                ))
+
+        # Holding-specific first, then newest.
+        ranked.sort(key=lambda row: (row[0], row[1]), reverse=True)
+        return SearchResponse(
+            query=query,
+            results=[row[2] for row in ranked][:max_results],
+            provider=self._name,
+            success=True,
+        )
+
+
 class SearchService:
     """
     搜索服务
@@ -2430,6 +2915,9 @@ class SearchService:
     # Intel dimensions that are plain "news about this symbol", and so can be
     # served by a symbol-scoped provider. The rest are open-ended web queries.
     SYMBOL_SCOPED_INTEL_DIMENSIONS = frozenset({"latest_news"})
+    # A dimension filled from several providers reports a combined label; keep
+    # it inside the persisted NewsIntel.provider column width (String(32)).
+    MERGED_PROVIDER_LABEL_MAX_LEN = 32
     _MACRO_NEWS_CATEGORY = "macro_market_news"
     _NEWS_CATEGORY_PRIORITY = {
         _DIRECT_NEWS_CATEGORY: 0,
@@ -2563,6 +3051,8 @@ class SearchService:
         searxng_base_urls: Optional[List[str]] = None,
         searxng_public_instances_enabled: bool = False,
         yfinance_news_enabled: bool = False,
+        finnhub_news_keys: Optional[List[str]] = None,
+        etf_constituent_news_enabled: bool = False,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
     ):
@@ -2579,6 +3069,8 @@ class SearchService:
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
             yfinance_news_enabled: 是否启用 Yahoo Finance 新闻兜底源（无需 API Key，默认关闭）
+            finnhub_news_keys: Finnhub API Key 列表，用于美股公司新闻（免费层）
+            etf_constituent_news_enabled: ETF 自身无新闻时是否回退到成分股新闻（无需 API Key）
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
@@ -2591,6 +3083,11 @@ class SearchService:
             "minimax_keys": list(minimax_keys or []),
             "searxng_base_urls": list(searxng_base_urls or []),
             "searxng_public_instances_enabled": bool(searxng_public_instances_enabled),
+            # 两个按标的取新闻的源也要带进隔离子进程，否则 topic-news 走子进程时
+            # 会静默少掉这两个兜底源（yfinance 这项此前就漏了）。
+            "yfinance_news_enabled": bool(yfinance_news_enabled),
+            "finnhub_news_keys": list(finnhub_news_keys or []),
+            "etf_constituent_news_enabled": bool(etf_constituent_news_enabled),
             "news_max_age_days": int(news_max_age_days),
             "news_strategy_profile": news_strategy_profile,
         }
@@ -2650,12 +3147,28 @@ class SearchService:
             else:
                 logger.info("已启用 SearXNG 公共实例自动发现模式")
 
+        # 6.4 Finnhub 公司新闻（免费层可用，按标的取新闻）。
+        # 排在 Yahoo 之前：同样是符号维度的源，但单次返回量高一个数量级，
+        # 在计费源额度耗尽、SearXNG 引擎被 CAPTCHA 拦截时能撑住美股舆情面。
+        # 注意：这里用的 /company-news 属于免费层，与 FinnhubFetcher 取日线用的
+        # /stock/candle（付费）是两回事，后者 403 不代表新闻不可用。
+        if finnhub_news_keys:
+            self._providers.append(FinnhubNewsProvider(finnhub_news_keys))
+            logger.info("已启用 Finnhub 公司新闻源（美股，免费层）")
+
         # 6.5 Yahoo Finance 新闻（无 key、无配额，作为保底源）。
         # 排在最后：它只能按标的取新闻，答不了开放式检索，但在计费源额度耗尽、
         # SearXNG 引擎被 CAPTCHA 拦截时，它是唯一还能产出新闻的来源。
         if yfinance_news_enabled:
             self._providers.append(YFinanceNewsProvider())
             logger.info("已启用 Yahoo Finance 新闻兜底源（无需 API Key）")
+
+        # 6.6 ETF 成分股新闻（无 key）。排在所有基金层来源之后：只有当 ETF 自身
+        # 确实没有新闻时才回退到成分股——冷门/杠杆 ETF 常年没有自己的新闻，但
+        # 驱动其价格的成分股有。
+        if etf_constituent_news_enabled:
+            self._providers.append(ETFConstituentNewsProvider())
+            logger.info("已启用 ETF 成分股新闻回退源（无需 API Key）")
 
         # 7. Anspire Search（实时智能搜索优化）
         if anspire_keys:
@@ -2788,6 +3301,7 @@ class SearchService:
                 success=response.success,
                 error_message=response.error_message,
                 search_time=response.search_time,
+                not_applicable=response.not_applicable,
             ),
             len(chinese_results),
         )
@@ -3578,6 +4092,7 @@ class SearchService:
             success=response.success,
             error_message=response.error_message,
             search_time=response.search_time,
+            not_applicable=response.not_applicable,
         )
 
     @classmethod
@@ -3644,6 +4159,7 @@ class SearchService:
             success=response.success,
             error_message=response.error_message,
             search_time=response.search_time,
+            not_applicable=response.not_applicable,
         )
 
     @classmethod
@@ -3926,6 +4442,7 @@ class SearchService:
             success=response.success,
             error_message=response.error_message,
             search_time=response.search_time,
+            not_applicable=response.not_applicable,
         )
 
     def _normalize_and_limit_response(
@@ -3963,6 +4480,7 @@ class SearchService:
             success=response.success,
             error_message=response.error_message,
             search_time=response.search_time,
+            not_applicable=response.not_applicable,
         )
 
     @staticmethod
@@ -3986,7 +4504,50 @@ class SearchService:
             success=response.success,
             error_message=response.error_message,
             search_time=response.search_time,
+            not_applicable=response.not_applicable,
         )
+
+    @staticmethod
+    def _intel_result_identity(item: SearchResult) -> str:
+        """Cross-provider identity for one news item.
+
+        Different providers surface the same article under cosmetically
+        different URLs (scheme, "www.", trailing slash, "#fragment"), so the URL
+        is normalized before it is used as the merge key. Items without a URL
+        fall back to title+source, mirroring the soft dedup key used when the
+        same items are persisted (see ``Database.save_news_intel``).
+        """
+        url = (item.url or "").split("#", 1)[0].strip().lower()
+        for scheme in ("https://", "http://"):
+            if url.startswith(scheme):
+                url = url[len(scheme):]
+                break
+        if url.startswith("www."):
+            url = url[4:]
+        url = url.rstrip("/")
+        if url:
+            return f"url:{url}"
+        title = (item.title or "").strip().lower()
+        source = (item.source or "").strip().lower()
+        return f"title:{title}|{source}"
+
+    @classmethod
+    def _merged_provider_label(cls, provider_names: List[str]) -> str:
+        """Label a response that was filled from more than one provider.
+
+        Kept within ``NewsIntel.provider`` (String(32)) so a merged label still
+        persists losslessly; longer chains degrade to "<first>+<n more>".
+        """
+        unique: List[str] = []
+        for name in provider_names:
+            if name and name not in unique:
+                unique.append(name)
+        if not unique:
+            return "None"
+        label = "+".join(unique)
+        if len(label) <= cls.MERGED_PROVIDER_LABEL_MAX_LEN:
+            return label
+        return f"{unique[0]}+{len(unique) - 1}"[: cls.MERGED_PROVIDER_LABEL_MAX_LEN]
 
     @staticmethod
     def _elapsed_ms(started_at: float) -> int:
@@ -4290,10 +4851,12 @@ class SearchService:
                 search_kwargs: Dict[str, Any] = {}
                 if isinstance(provider, TavilySearchProvider):
                     search_kwargs["topic"] = "news"
-                elif isinstance(provider, YFinanceNewsProvider):
-                    # It looks up a symbol rather than running the text query.
+                elif not getattr(provider, "supports_open_ended_queries", True):
+                    # Symbol-scoped sources (Finnhub, Yahoo and ETF constituent
+                    # news) cannot answer the text query without the target code.
                     search_kwargs["stock_code"] = stock_code
-                    search_kwargs["region"] = region
+                    if isinstance(provider, YFinanceNewsProvider):
+                        search_kwargs["region"] = region
                 elif isinstance(provider, BraveSearchProvider):
                     search_kwargs.update(
                         self._brave_search_locale(
@@ -4422,18 +4985,31 @@ class SearchService:
                         )
                 else:
                     filtered_count = len(filtered_response.results or []) if filtered_response.success else 0
+                    provider_not_applicable = bool(response.not_applicable)
                     self._record_news_search_run(
                         provider=provider.name,
                         operation="search_stock_news",
                         success=bool(filtered_response.success and filtered_response.results),
                         latency_ms=self._elapsed_ms(started_at),
                         record_count=filtered_count,
-                        error_type=None if filtered_count else "NoUsableNews",
+                        error_type=(
+                            None
+                            if filtered_count
+                            else "not_applicable"
+                            if provider_not_applicable
+                            else "NoUsableNews"
+                        ),
                         error_message=None if filtered_count else (
                             response.error_message or "过滤后无有效新闻"
                         ),
                     )
-                    if response.success and not filtered_response.results:
+                    if provider_not_applicable:
+                        logger.info(
+                            "%s 对当前标的不适用，跳过并继续下一引擎: %s",
+                            provider.name,
+                            response.error_message,
+                        )
+                    elif response.success and not filtered_response.results:
                         logger.info(
                             "%s 搜索成功但过滤后无有效新闻，继续尝试下一引擎",
                             provider.name,
@@ -4559,7 +5135,12 @@ class SearchService:
     ) -> SearchResponse:
         """Execute one intelligence query while preserving provider extensions."""
         try:
-            if isinstance(provider, YFinanceNewsProvider):
+            # Symbol-scoped sources need the code: they look news up by ticker
+            # rather than searching the query text. Keyed on the declared
+            # capability rather than a concrete class, so any such provider is
+            # handed the code - gating on isinstance(YFinanceNewsProvider)
+            # silently passed stock_code=None to every other one.
+            if not provider.supports_open_ended_queries:
                 return provider.search(
                     dimension["query"],
                     max_results=max_results,
@@ -4849,6 +5430,16 @@ class SearchService:
             )
             filtered_response = response
 
+            # The chain walks providers in preference order and keeps going
+            # while the accumulated (already filtered/ranked/admitted) count is
+            # still short of the target. Stopping at the first non-empty
+            # response used to settle for a single weak item and never reach the
+            # next source, which for some symbols holds the relevant news.
+            merged_results: List[SearchResult] = []
+            merged_identities: set = set()
+            contributions: List[SearchResponse] = []
+            contributing_providers: List[str] = []
+
             for attempt, provider in enumerate(providers_to_try):
                 if attempt == 0:
                     logger.info(
@@ -4856,6 +5447,14 @@ class SearchService:
                         dim['desc'],
                         provider.name,
                         request_days,
+                    )
+                elif merged_results:
+                    logger.info(
+                        "[情报搜索] %s: 前序渠道仅累计 %s/%s 条，继续向 %s 补充",
+                        dim['desc'],
+                        len(merged_results),
+                        target_per_dimension,
+                        provider.name,
                     )
                 else:
                     logger.info(
@@ -4881,15 +5480,29 @@ class SearchService:
                     max_results=provider_max_results,
                     target_results=target_per_dimension,
                 )
+
+                added = 0
+                for item in filtered_response.results or []:
+                    identity = self._intel_result_identity(item)
+                    if identity in merged_identities:
+                        continue
+                    merged_identities.add(identity)
+                    merged_results.append(item)
+                    added += 1
+                if added:
+                    contributions.append(filtered_response)
+                    contributing_providers.append(provider.name)
+
                 logger.info(
-                    "[情报搜索] %s/%s: 原始=%s条, 过滤后=%s条",
+                    "[情报搜索] %s/%s: 原始=%s条, 过滤后=%s条, 新增=%s条, 累计=%s/%s",
                     dim['desc'],
                     provider.name,
                     len(response.results),
                     len(filtered_response.results),
+                    added,
+                    len(merged_results),
+                    target_per_dimension,
                 )
-                if filtered_response.results:
-                    break
                 if not response.success:
                     logger.warning(
                         "[情报搜索] %s/%s: 搜索失败 - %s",
@@ -4897,8 +5510,36 @@ class SearchService:
                         provider.name,
                         response.error_message,
                     )
+                if len(merged_results) >= target_per_dimension:
+                    break
 
-            results[dim['name']] = filtered_response
+            if not contributions:
+                # No provider yielded anything: keep the last attempt verbatim so
+                # the failure/error accounting downstream is unchanged.
+                dimension_response = filtered_response
+            elif len(contributions) == 1:
+                # Single source: hand back the very object the old chain would
+                # have returned, metadata included.
+                dimension_response = contributions[0]
+            else:
+                merged_success = any(item.success for item in contributions)
+                dimension_response = SearchResponse(
+                    query=dim["query"],
+                    results=merged_results[:target_per_dimension],
+                    provider=self._merged_provider_label(contributing_providers),
+                    success=merged_success,
+                    error_message=None if merged_success else filtered_response.error_message,
+                    search_time=sum(item.search_time for item in contributions),
+                )
+                logger.info(
+                    "[情报搜索] %s: 合并 %s 个渠道后共 %s 条（目标 %s）",
+                    dim['desc'],
+                    len(contributing_providers),
+                    len(dimension_response.results),
+                    target_per_dimension,
+                )
+
+            results[dim['name']] = dimension_response
             search_count += 1
             
             # 短暂延迟避免请求过快
@@ -5198,6 +5839,14 @@ def get_search_service() -> SearchService:
                     searxng_base_urls=config.searxng_base_urls,
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
                     yfinance_news_enabled=getattr(config, "yfinance_news_enabled", True),
+                    finnhub_news_keys=(
+                        [config.finnhub_api_key]
+                        if getattr(config, "finnhub_api_key", None)
+                        else []
+                    ),
+                    etf_constituent_news_enabled=getattr(
+                        config, "etf_constituent_news_enabled", False
+                    ),
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )

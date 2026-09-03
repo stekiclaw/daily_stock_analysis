@@ -13,6 +13,10 @@ const packageJson = JSON.parse(
 ) as { version?: string }
 const buildTime = new Date().toISOString()
 const placeholderVersion = '0.0.0'
+const configuredBasePath = (process.env.VITE_BASE_PATH || '/').trim()
+const viteBasePath = configuredBasePath === '/'
+  ? '/'
+  : `/${configuredBasePath.replace(/^\/+|\/+$/g, '')}/`
 
 const buildInputFiles = [
   'package.json',
@@ -213,6 +217,7 @@ const getVendorChunkName = (id: string): string | undefined => {
 
 // https://vite.dev/config/
 export default defineConfig({
+  base: viteBasePath,
   define: {
     __APP_PACKAGE_VERSION__: JSON.stringify(appVersion),
     __APP_REVISION__: JSON.stringify(appRevision),

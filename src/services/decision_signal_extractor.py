@@ -332,9 +332,16 @@ def _extract_guardrail_reason(
     raw_action: Optional[str],
 ) -> Optional[str]:
     score_calibration = _as_mapping(dashboard.get("decision_score_calibration"))
+    decision_stability = _as_mapping(dashboard.get("decision_stability"))
+    stability_applied = decision_stability.get("applied")
+    stability_reason = (
+        decision_stability.get("reason")
+        if stability_applied not in (False, 0, "0", "false", "False")
+        else None
+    )
     reason = _first_text(
         score_calibration.get("guardrail_reason"),
-        _as_mapping(dashboard.get("decision_stability")).get("reason"),
+        stability_reason,
         getattr(result, "guardrail_reason", None),
     )
     if reason:

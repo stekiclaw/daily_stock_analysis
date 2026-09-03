@@ -9,6 +9,7 @@ import type {
   MarketReviewPayloadSection,
   ReportLanguage,
 } from '../../types/analysis';
+import { copyToClipboard } from '../../utils/clipboard';
 import { markdownToPlainText } from '../../utils/markdown';
 import { getReportText, normalizeReportLanguage } from '../../utils/reportLanguage';
 import { Card } from '../common';
@@ -436,13 +437,10 @@ export const MarketReviewReportView: React.FC<MarketReviewReportViewProps> = ({
     if (!content) {
       return;
     }
-    try {
-      const value = type === 'markdown' ? content : markdownToPlainText(content);
-      await navigator.clipboard.writeText(value);
+    const value = type === 'markdown' ? content : markdownToPlainText(content);
+    if (await copyToClipboard(value)) {
       setCopiedType(type);
       window.setTimeout(() => setCopiedType(null), 2000);
-    } catch (err) {
-      console.error('Copy failed:', err);
     }
   }, [content]);
 

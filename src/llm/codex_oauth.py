@@ -22,10 +22,18 @@ import base64
 import json
 import os
 import stat
+import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+
+try:  # pragma: no cover - Windows uses the in-process lock fallback.
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
 
 import requests
 
@@ -57,6 +65,9 @@ DEVICE_DEFAULT_POLL_INTERVAL = 5
 # Refresh this far ahead of expiry so a long generation cannot straddle it.
 REFRESH_SKEW_SECONDS = 120
 AUTH_REQUEST_TIMEOUT_SECONDS = 60
+
+_CREDENTIAL_LOCKS_GUARD = threading.Lock()
+_CREDENTIAL_LOCKS: Dict[str, threading.Lock] = {}
 
 
 @dataclass
@@ -112,11 +123,45 @@ def decode_jwt_claims(token: str) -> Dict[str, Any]:
 # --- credential storage -----------------------------------------------------
 
 
-def load_credential(path: str) -> Dict[str, Any]:
-    """Load the OAuth bundle, or raise ``login_required`` when absent."""
+def _credential_path(path: str) -> str:
     if not path:
         raise CodexOAuthError("login_required", "未配置 CODEX_OAUTH_AUTH_FILE")
-    expanded = os.path.expanduser(path)
+    return os.path.abspath(os.path.expanduser(path))
+
+
+@contextmanager
+def _credential_lock(path: str) -> Iterator[None]:
+    """Serialize token rotation across Agent/generation threads and processes."""
+    expanded = _credential_path(path)
+    directory = os.path.dirname(expanded) or "."
+    os.makedirs(directory, mode=stat.S_IRWXU, exist_ok=True)
+
+    with _CREDENTIAL_LOCKS_GUARD:
+        thread_lock = _CREDENTIAL_LOCKS.setdefault(expanded, threading.Lock())
+
+    lock_path = f"{expanded}.lock"
+    with thread_lock:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, stat.S_IRUSR | stat.S_IWUSR)
+            os.fchmod(lock_fd, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError as exc:
+            raise CodexOAuthError("invalid_credential", f"无法创建凭证锁: {exc}") from exc
+        try:
+            if fcntl is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(lock_fd)
+
+
+def load_credential(path: str) -> Dict[str, Any]:
+    """Load the OAuth bundle, or raise ``login_required`` when absent."""
+    expanded = _credential_path(path)
     if not os.path.exists(expanded):
         raise CodexOAuthError(
             "login_required",
@@ -132,29 +177,41 @@ def load_credential(path: str) -> Dict[str, Any]:
     return credential
 
 
-def save_credential(path: str, credential: Dict[str, Any]) -> str:
-    """Persist the OAuth bundle with owner-only permissions.
-
-    The write is atomic so a crashed refresh cannot leave a half-written
-    credential behind for the next request to trip over.
-    """
-    expanded = os.path.expanduser(path)
+def _save_credential_unlocked(path: str, credential: Dict[str, Any]) -> str:
+    expanded = _credential_path(path)
     directory = os.path.dirname(expanded) or "."
-    os.makedirs(directory, exist_ok=True)
-    try:
-        os.chmod(directory, stat.S_IRWXU)
-    except OSError:
-        pass
+    os.makedirs(directory, mode=stat.S_IRWXU, exist_ok=True)
 
-    tmp_path = f"{expanded}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump(credential, handle, indent=2, ensure_ascii=False)
+    fd = -1
+    tmp_path = ""
     try:
-        os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
-    os.replace(tmp_path, expanded)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(expanded)}.",
+            dir=directory,
+        )
+        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(credential, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, expanded)
+    except OSError as exc:
+        if fd >= 0:
+            os.close(fd)
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+        raise CodexOAuthError("invalid_credential", f"凭证文件无法写入: {exc}") from exc
     return expanded
+
+
+def save_credential(path: str, credential: Dict[str, Any]) -> str:
+    """Persist the OAuth bundle atomically with owner-only permissions."""
+    with _credential_lock(path):
+        return _save_credential_unlocked(path, credential)
 
 
 def build_credential(
@@ -328,8 +385,22 @@ def device_login(
 # --- refresh ----------------------------------------------------------------
 
 
-def refresh_credential(credential: Dict[str, Any], path: str) -> Dict[str, Any]:
-    """Exchange the refresh token for a new access token and persist it."""
+def _credential_is_fresh(credential: Dict[str, Any]) -> bool:
+    try:
+        expires_at = float(credential.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    return expires_at - time.time() > REFRESH_SKEW_SECONDS
+
+
+def _latest_credential(path: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
+    expanded = _credential_path(path)
+    return load_credential(expanded) if os.path.exists(expanded) else fallback
+
+
+def _refresh_credential_unlocked(
+    credential: Dict[str, Any], path: str
+) -> Dict[str, Any]:
     refresh_token = (credential.get("refresh_token") or "").strip()
     if not refresh_token:
         raise CodexOAuthError("login_required", "凭证缺少 refresh_token，需要重新登录")
@@ -355,21 +426,40 @@ def refresh_credential(credential: Dict[str, Any], path: str) -> Dict[str, Any]:
         raise CodexOAuthError(
             "refresh_failed", _truncate(response.text), response.status_code
         )
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise CodexOAuthError("refresh_failed", "刷新响应不是有效 JSON") from exc
+    if not isinstance(payload, dict) or not payload.get("access_token"):
+        raise CodexOAuthError("refresh_failed", "刷新响应缺少 access_token")
 
-    refreshed = build_credential(response.json(), previous=credential)
-    save_credential(path, refreshed)
+    refreshed = build_credential(payload, previous=credential)
+    _save_credential_unlocked(path, refreshed)
     return refreshed
 
 
+def refresh_credential(credential: Dict[str, Any], path: str) -> Dict[str, Any]:
+    """Rotate and persist a token once across concurrent workers."""
+    with _credential_lock(path):
+        latest = _latest_credential(path, credential)
+        # Another worker may have refreshed while this request was waiting.
+        if (
+            latest.get("access_token") != credential.get("access_token")
+            and _credential_is_fresh(latest)
+        ):
+            return latest
+        return _refresh_credential_unlocked(latest, path)
+
+
 def ensure_fresh_credential(credential: Dict[str, Any], path: str) -> Dict[str, Any]:
-    """Refresh the credential when it is at or near expiry."""
-    try:
-        expires_at = float(credential.get("expires_at") or 0)
-    except (TypeError, ValueError):
-        expires_at = 0.0
-    if expires_at - time.time() > REFRESH_SKEW_SECONDS:
+    """Refresh an expiring credential once across all local workers."""
+    if _credential_is_fresh(credential):
         return credential
-    return refresh_credential(credential, path)
+    with _credential_lock(path):
+        latest = _latest_credential(path, credential)
+        if _credential_is_fresh(latest):
+            return latest
+        return _refresh_credential_unlocked(latest, path)
 
 
 # --- generation transport ---------------------------------------------------

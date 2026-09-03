@@ -328,6 +328,13 @@ _CHIP_PLACEHOLDER_EXACT = {
     "na",
     "none",
     "null",
+    "nan",
+    "inf",
+    "+inf",
+    "-inf",
+    "infinity",
+    "+infinity",
+    "-infinity",
     "unknown",
     "tbd",
     "数据缺失",
@@ -999,10 +1006,40 @@ def localize_confidence_level(value: Any, language: Optional[str]) -> str:
     )
 
 
+_STRATEGY_NULLISH_TOKENS = {
+    "",
+    "none",
+    "null",
+    "nan",
+    "inf",
+    "+inf",
+    "-inf",
+    "infinity",
+    "+infinity",
+    "-infinity",
+    "n/a",
+    "na",
+}
+
+
+def _strategy_display_value(value: Any, *, allow_none: bool = False) -> str:
+    """Normalize model placeholders before strategy labels reach renderers."""
+    raw_text = str(value or "").strip()
+    lowered = raw_text.lower()
+    if lowered in _STRATEGY_NULLISH_TOKENS and not (
+        allow_none and lowered == "none"
+    ):
+        return "N/A"
+    return raw_text
+
+
 def localize_strategy_signal(value: Any, language: Optional[str]) -> str:
     """Translate strategy signal labels when recognized."""
+    display_value = _strategy_display_value(value)
+    if display_value == "N/A":
+        return display_value
     return _translate_from_map(
-        value,
+        display_value,
         language,
         canonical_map=_STRATEGY_SIGNAL_CANONICAL_MAP,
         translations=_STRATEGY_SIGNAL_TRANSLATIONS,
@@ -1011,8 +1048,11 @@ def localize_strategy_signal(value: Any, language: Optional[str]) -> str:
 
 def localize_consensus_level(value: Any, language: Optional[str]) -> str:
     """Translate strategy consensus levels when recognized."""
+    display_value = _strategy_display_value(value)
+    if display_value == "N/A":
+        return display_value
     return _translate_from_map(
-        value,
+        display_value,
         language,
         canonical_map=_CONSENSUS_LEVEL_CANONICAL_MAP,
         translations=_CONSENSUS_LEVEL_TRANSLATIONS,
@@ -1021,8 +1061,13 @@ def localize_consensus_level(value: Any, language: Optional[str]) -> str:
 
 def localize_conflict_severity(value: Any, language: Optional[str]) -> str:
     """Translate strategy conflict severity when recognized."""
+    # ``none`` is a real conflict-severity enum, unlike placeholder ``None``
+    # values in free-form skill/signal fields.
+    display_value = _strategy_display_value(value, allow_none=True)
+    if display_value == "N/A":
+        return display_value
     return _translate_from_map(
-        value,
+        display_value,
         language,
         canonical_map=_CONFLICT_SEVERITY_CANONICAL_MAP,
         translations=_CONFLICT_SEVERITY_TRANSLATIONS,
@@ -1031,8 +1076,11 @@ def localize_conflict_severity(value: Any, language: Optional[str]) -> str:
 
 def localize_strategy_skill(value: Any, language: Optional[str]) -> str:
     """Translate strategy skill names when recognized."""
+    display_value = _strategy_display_value(value)
+    if display_value == "N/A":
+        return display_value
     return _translate_from_map(
-        value,
+        display_value,
         language,
         canonical_map=_STRATEGY_SKILL_CANONICAL_MAP,
         translations=_STRATEGY_SKILL_TRANSLATIONS,
@@ -1082,7 +1130,9 @@ def is_chip_structure_unavailable(chip_data: Any) -> bool:
 def localize_strategy_conflict_description(conflict_type: Any, language: Optional[str]) -> str:
     """Translate strategy conflict type into a display sentence at render boundaries."""
     lang = normalize_report_language(language)
-    key = str(conflict_type or "").strip()
+    key = _strategy_display_value(conflict_type)
+    if key == "N/A":
+        return key
     translations = {
         "directional_opposition": {
             "zh": "策略方向出现对立：部分策略看多，部分策略看空，综合结论需要降低确定性。",
@@ -1120,13 +1170,46 @@ def normalize_strategy_synthesis_payload(value: Any) -> Dict[str, Any]:
         return {}
 
     payload = dict(value)
-    for key in ("supporting_skills", "opposing_skills", "conflicts"):
+    for key in ("supporting_skills", "opposing_skills"):
         items = payload.get(key)
-        payload[key] = (
-            [item for item in items if isinstance(item, dict)]
-            if isinstance(items, list)
-            else []
-        )
+        normalized_items = []
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                skill_id = _strategy_display_value(item.get("skill_id"))
+                if skill_id == "N/A":
+                    continue
+                normalized_item = dict(item)
+                normalized_item["skill_id"] = skill_id
+                signal = _strategy_display_value(item.get("signal"))
+                if signal == "N/A":
+                    normalized_item.pop("signal", None)
+                else:
+                    normalized_item["signal"] = signal
+                normalized_items.append(normalized_item)
+        payload[key] = normalized_items
+
+    conflicts = payload.get("conflicts")
+    normalized_conflicts = []
+    if isinstance(conflicts, list):
+        for conflict in conflicts:
+            if not isinstance(conflict, dict):
+                continue
+            conflict_type = _strategy_display_value(conflict.get("conflict_type"))
+            if conflict_type == "N/A":
+                continue
+            normalized_conflict = dict(conflict)
+            normalized_conflict["conflict_type"] = conflict_type
+            participants = conflict.get("participants")
+            if isinstance(participants, list):
+                normalized_conflict["participants"] = [
+                    participant
+                    for participant in participants
+                    if _strategy_display_value(participant) != "N/A"
+                ]
+            normalized_conflicts.append(normalized_conflict)
+    payload["conflicts"] = normalized_conflicts
     return payload
 
 

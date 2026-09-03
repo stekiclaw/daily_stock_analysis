@@ -4,6 +4,7 @@ import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { ChevronDown, SlidersHorizontal } from 'lucide-react';
 import { cn } from '../utils/cn';
+import { copyToClipboard } from '../utils/clipboard';
 import { agentApi } from '../api/agent';
 import { systemConfigApi } from '../api/systemConfig';
 import { ApiErrorAlert, Badge, Button, ConfirmDialog, EmptyState, InlineAlert, ScrollArea, Tooltip } from '../components/common';
@@ -776,24 +777,22 @@ const ChatPage: React.FC = () => {
   };
 
   const copyMessageToClipboard = async (msgId: string, content: string) => {
-    try {
-      await navigator.clipboard.writeText(content);
-      setCopiedMessages((prev) => new Set(prev).add(msgId));
-      const existingTimer = copyResetTimerRef.current[msgId];
-      if (existingTimer !== undefined) {
-        window.clearTimeout(existingTimer);
-      }
-      copyResetTimerRef.current[msgId] = window.setTimeout(() => {
-        setCopiedMessages((prev) => {
-          const next = new Set(prev);
-          next.delete(msgId);
-          return next;
-        });
-        delete copyResetTimerRef.current[msgId];
-      }, 2000);
-    } catch (err) {
-      console.error('Copy failed:', err);
+    if (!await copyToClipboard(content)) {
+      return;
     }
+    setCopiedMessages((prev) => new Set(prev).add(msgId));
+    const existingTimer = copyResetTimerRef.current[msgId];
+    if (existingTimer !== undefined) {
+      window.clearTimeout(existingTimer);
+    }
+    copyResetTimerRef.current[msgId] = window.setTimeout(() => {
+      setCopiedMessages((prev) => {
+        const next = new Set(prev);
+        next.delete(msgId);
+        return next;
+      });
+      delete copyResetTimerRef.current[msgId];
+    }, 2000);
   };
 
   const downloadMessageAsMarkdown = useCallback((msg: Message) => {

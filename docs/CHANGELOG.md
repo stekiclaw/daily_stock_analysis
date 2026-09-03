@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 非交易日明确 `is_trading_day=false` 时，普通与 Agent 分析、历史 API meta 和 DecisionSignal 统一使用官方日线 `close/pct_chg`；官方字段仅在有限数值时逐字段覆盖，phase 未知或 estimated bar 保持实时值，Agent 快照同步持久化实际 `date/today/yesterday`。
+- [修复] 报告与 Prompt 的数值边界统一拒绝 `None`、NaN、Infinity 和孤立单位，覆盖行情、趋势、筹码、财务、资金流、核心结论、持仓/仓位、多策略技能与冲突字段；合法 `0`、`False` 和 conflict severity `none` 保留真实语义。
+- [修复] API/history 的结构化财报和分红递归转换 NumPy 标量/数组并支持 strict JSON；全非有限 overlay（含 ndarray/list/tuple）不再抹掉已有有限 fallback，含真实有限值或 0 的 overlay 仍正常清洗后采用。
+- [修复] 大盘复盘过滤指数与板块 payload 中的非有限值；VIX 不再被当作权益方向，核心权益指数不可用时 Market Light 为 yellow/50/unavailable，context quality 为 usable/75，US breadth/limit 结构性不支持不误降核心方向质量。
+- [修复] YFinance 实时行情和美股筛选在报价币种与财务币种均明确且不一致时不采用原始 `priceToBook`，避免 ADR 跨币种混算；币种未知或一致时保留 provider 原值。
+- [修复] 美股实时行情保留真实 provider 身份：YFinance / Finnhub / Alpha Vantage 不再自称通用 fallback；运行流程按 data type 区分 primary、真实 fallback、supplement 与 skipped，补充源和结构性不适用不再污染降级计数。
+- [修复] Agent 在调用 A 股专属筹码接口前先判定美股/港股/ETF/指数能力边界；工具实际消费的新闻标题、摘要、来源、日期和脱敏 URL 会进入最终 context-pack、`news_content` 与历史快照，不再以分析后的第二次补查冒充模型输入。
+- [修复] Finnhub、Yahoo 与 ETF 成分股等 symbol-scoped 新闻源统一收到 `stock_code`，不适用来源记为 `not_applicable/skipped`；Finnhub 上游已确认的 UTF-8 标点 mojibake 按显式白名单修复。
+
 - [新功能] 支持通过 `main.py --stocks` 一次性分析已登记板块指数，自动使用指数适用的数据与分析能力，并保持报告、历史和决策信号兼容。
 - [修复] `main.py --stocks` 在解析股票列表前先 best-effort 刷新股票索引注册表，保证首次运行能吃到刷新后的指数 alias/身份；刷新失败、超时或禁用不阻断分析。
 - [修复] 交易日过滤对市场未知的指数 code（如 `sh000016`/`csi930955`/`930955.CSI`）按 `market=cn` 参与 A 股休市过滤，避免休市日指数被 fail-open 保留；市场仍未知的非指数 code 继续保留。
@@ -19,14 +28,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] Web Chat 意图识别层新增分词模块：`web_intent_tokenizer` 六步管道（多股票全名实体扫描 → 标点/空白切分 → 代码形提取 → 市场关键词 → 无歧义关键词 → 残存 gap 多策略 DFS 匹配）把用户消息切分为携带语义标签的 Token 序列；配套 `web_intent_types` 数据字典（Token 结构、Market 枚举、21 个语义 tag、clean/extend 双词池与正则机器）。核心原则"宁可不做，不可做错"：Step 1~5 只做精确匹配，Step 6 要求整段 TAG 全覆盖（交叉验证）才产出，未覆盖片段保持空 tag 交下游 LLM 兜底；代码形 token 辨认为 `stock_code`（附 code/name/market 三元组）/ `wrong_{market}_code` / `unknown_{market}_code` 三态，token 层代码拼写统一 canonical 归一（a=6 位裸数字、hk=HK+5 位、us=大写 ticker）。意图枚举与意图识别结果随后续 `web_intent_resolver` PR 引入。新增 183 个分词单元测试。
 - [新功能] Web 设置页支持 OpenAI-OAuth：「AI 模型接入」新增授权卡片，可在页面上完成设备码授权（显示验证链接与设备码、自动轮询、展示已授权账号与凭证有效期），「快速添加渠道」的服务商下拉新增 OpenAI-OAuth 入口；新增 `CODEX_OAUTH_MODEL` / `CODEX_OAUTH_REASONING_EFFORT` / `CODEX_OAUTH_AUTH_FILE` 配置项。配套新增 `/api/v1/system/config/codex-oauth/status|login` 接口，浏览器全程不接触 token。
 - [新功能] 新增 `codex_oauth` 生成后端：用 ChatGPT/Codex 订阅的 OAuth 设备码授权直连 ChatGPT Responses 接口，不需要本机 CLI，也不消耗按量计费的 `OPENAI_API_KEY`；支持显式选择 gpt-5.6 系列模型与推理档位，并上报真实 token 用量。配置 `GENERATION_BACKEND=codex_oauth` 启用，授权入口为 `python scripts/codex_oauth_login.py`。作为生成后端时覆盖普通分析与大盘复盘。
-- [改进] `stock_list_us_etf.csv` 补充 `RAM`（Roundhill T-REX 2x Long DRAM Daily Target ETF）与 `DRAM`（Roundhill Memory ETF），种子数据源扩充至 94 只；`RAM` 同步接入 `get_leveraged_etf_metadata`（2x 做多，跟踪标的为 DRAM ETF 自身日内价格表现，而非传统指数）。
-- [改进] `stock_list_us_etf.csv` 种子数据源扩充至 92 只，新增约 30 只杠杆/反向 ETF（ProShares/Direxion 2x/3x 做多做空，覆盖大盘指数、行业板块、国债、金矿、中国、天然气等），自动补全下拉相应覆盖。
-- [新功能] `DataFetcherManager` 新增 `get_leveraged_etf_metadata`，静态查表返回杠杆/反向 ETF 的发行方/跟踪标的/杠杆倍数/方向/每日重置风险提示，标的不在已知清单内（含普通非杠杆 ETF）时返回 `not_supported`。
-- [新功能] `DataFetcherManager` 新增 `get_stock_extended_profile`，基于 yfinance 提供个股扩展基本面（PEG/EV-EBITDA/市销率/远期市盈率等估值倍数、资产负债表快照、分析师目标价一致预期、52周区间、空头持仓、下次财报日与营收/EPS 一致预期），与现有 `get_fundamental_bundle` 互补而不重复。
-- [改进] 股票搜索框自动补全下拉支持美股 ETF：`scripts/generate_index_from_csv.py` 新增 `stock_list_us_etf.csv` 种子数据源（`scripts/stock_index_seeds/`），生成的索引条目 `market="ETF"`、`assetType="etf"`；`stocks.index.json` 已同步补充；`SUPPORTED_STOCK_INDEX_MARKETS` 新增 `ETF`。前端 `StockAutocomplete`/`SuggestionsList` 组件原本已支持 ETF 徽标与类型，此前因索引数据源缺失 ETF 数据而没有下拉提示。
-- [新功能] `DataFetcherManager` 新增 `get_option_expirations` / `get_option_chain`，基于 yfinance 提供美股/ETF 期权到期日与期权链（Calls/Puts，含 strike/bid/ask/last/volume/openInterest/impliedVolatility），fail-open，标的不支持期权时返回 None。
-- [新功能] `DataFetcherManager` 新增 `get_etf_profile`，基于 yfinance `info`/`funds_data` 提供 ETF 专属信息（category/fund_family/expense_ratio_pct/nav/aum/distribution_yield_pct/ytd_return_pct/top_holdings/sector_weights），通过 `info.quoteType == "ETF"` 判定，与现有基本面聚合流程（`get_fundamental_context`）相互独立、互不影响。
 - [新功能] 新增 `--portfolio futu`，只读导入 Futu OpenD 真实账户的沪深 A 股、港股、美股 LONG 正股持仓作为分析列表。
+- [修复] 主力资金流「该市场本就不提供」(`not_supported`) 不再被当作看空证据下调买入结论：仅记录未做资金流校准；数据源支持但取数为空/`N/A` 时保持原有保守降级。
+- [修复] 分析提示词按标的实际计价币种标注价格单位（美元/港元/日元/韩元/新台币/元），优先采用行情源返回的 `currency`，其次按市场推断；狙击点位示例同步跟随，避免把美股价格写成人民币「元」。
+- [修复] Codex OAuth 凭证刷新加进程内 + 跨进程文件锁并在加锁后重读凭证，避免多 worker 同时用同一 refresh_token 轮换导致互相失效；凭证改为同目录唯一临时文件原子写入（0600），不再 chmod 已存在的父目录。
+- [修复] Codex OAuth 设备码登录取消后立即结束轮询，不再继续请求上游直到超时。
+- [修复] Codex OAuth 生成后端按 `GENERATION_BACKEND_MAX_CONCURRENCY` 全进程限流，此前每个后端实例各自计数，等于没有并发上限。
+- [修复] Agent 工具循环回放 Responses `function_call` 时同时带上原始 output-item `id`（保存在 `provider_specific_fields`），修复多轮工具调用被上游拒绝。
+- [修复] 前端补回缺失的 `utils/clipboard`，复制统一走 Clipboard API + `execCommand` 回退，HTTP 局域网部署下复制不再静默失败；仅在复制成功后显示「已复制」。
+- [修复] `/dsa/` 子路径部署：Docker 构建透传 `VITE_BASE_PATH`，Vite `base`、路由 `basename`、API baseURL、登录跳转与 `stocks.index.json` 均按部署前缀解析。
+- [文档] 移除 Unreleased 中 ETF 种子数据、`get_leveraged_etf_metadata`、`get_stock_extended_profile`、`get_option_expirations` / `get_option_chain`、`get_etf_profile` 等仓库中并不存在的条目。
+- [新功能] schedule 模式新增可选的决策信号后验维护任务，按有界批次自动补齐缺失 outcome 并重试行情数据可恢复的 unable，不调用 LLM。
+- [修复] 多维情报搜索在首选开放式搜索渠道配额耗尽、异常或过滤后无结果时继续尝试其他同能力渠道，同时保持 Yahoo Finance 只服务标的新闻维度。
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [新功能] 完善 Futu OpenD 港股数据源接入：系统设置支持 OpenD 地址、端口和港股实时数据源优先级，保留 Longbridge、AkShare、YFinance fallback。

@@ -116,7 +116,12 @@ def _handle_search_stock_news(stock_code: str, stock_name: str) -> dict:
             "error": response.error_message,
         }
 
-    record_news_evidence(len(response.results))
+    record_news_evidence(
+        len(response.results),
+        results=response.results,
+        dimension="latest_news",
+        provider=response.provider,
+    )
 
     _persist_news_response(
         stock_code=stock_code,
@@ -192,14 +197,23 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
     # Format into readable report
     report = service.format_intel_report(intel_results, query_name)
 
-    # 本次真正交给 Agent 的证据条数，按维度累计后一次性记录。
+    # 本次真正交给 Agent 的证据条数。format_intel_report() 每个维度最多
+    # 展示 4 条，所以计数和持久化快照也只能登记这 4 条，不能把未进入工具
+    # 返回值的 provider 余量算作模型已消费证据。
     evidence_count = 0
 
     # Also return structured data
     dimensions = {}
     for dim_name, response in intel_results.items():
         if response and response.success:
-            evidence_count += len(response.results)
+            consumed_results = list(response.results[:4])
+            evidence_count += len(consumed_results)
+            record_news_evidence(
+                len(consumed_results),
+                results=consumed_results,
+                dimension=dim_name,
+                provider=response.provider,
+            )
             _persist_news_response(
                 stock_code=stock_code,
                 stock_name=query_name,
@@ -219,7 +233,8 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
                 ],
             }
 
-    record_news_evidence(evidence_count)
+    if evidence_count == 0:
+        record_news_evidence(0)
 
     return {
         "report": report,

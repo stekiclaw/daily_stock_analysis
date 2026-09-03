@@ -292,8 +292,13 @@ def test_open_ended_dimension_fails_over_to_another_capable_provider(monkeypatch
     # Secondary, whose exhausted response must fall back to Primary.
     assert responses["market_analysis"].provider == "Primary"
     assert responses["market_analysis"].results
-    assert len(secondary.calls) == 1
+    # Each fake returns a single item against a target of 3, so the chain stays
+    # below target and walks the whole preference list for both dimensions:
+    # latest_news = Primary + Secondary, market_analysis = Secondary + Primary.
+    assert len(secondary.calls) == 2
     assert len(primary.calls) == 2
+    assert responses["latest_news"].provider == "Primary+Secondary"
+    assert len(responses["latest_news"].results) == 2
 
 
 def test_open_ended_dimension_does_not_fall_back_to_the_symbol_source(

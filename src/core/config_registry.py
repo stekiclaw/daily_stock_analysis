@@ -1319,6 +1319,27 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {},
         "display_order": 54,
     },
+    "ETF_CONSTITUENT_NEWS_ENABLED": {
+        "title": "ETF Constituent News Fallback",
+        "description": (
+            "When an ETF has no news of its own, fetch news for its top holdings instead. "
+            "Thinly covered and leveraged/inverse ETFs routinely go weeks without a headline "
+            "under their own ticker, yet their price is driven by the constituents. No API key "
+            "and no quota. Only fires when the fund-level sources return nothing, and results "
+            "are attributed to the holding they came from. Leveraged/inverse funds holding only "
+            "cash collateral still resolve to nothing. Default: false."
+        ),
+        "category": "data_source",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 55,
+    },
     "ENABLE_REALTIME_QUOTE": {
         "title": "Enable Realtime Quote",
         "description": "Enable realtime market quotes. Disable to only use historical close prices.",
@@ -4980,6 +5001,15 @@ _FIELD_HELP_METADATA: Dict[str, Dict[str, Any]] = {
         "examples": [
             "YFINANCE_NEWS_ENABLED=true",
             "YFINANCE_NEWS_ENABLED=false",
+        ],
+        "docs": _DOC_FULL_GUIDE_SEARCH,
+        "warning_codes": [],
+    },
+    "ETF_CONSTITUENT_NEWS_ENABLED": {
+        "help_key": "settings.data_source.SEARXNG_BASE_URLS",
+        "examples": [
+            "ETF_CONSTITUENT_NEWS_ENABLED=true",
+            "ETF_CONSTITUENT_NEWS_ENABLED=false",
         ],
         "docs": _DOC_FULL_GUIDE_SEARCH,
         "warning_codes": [],

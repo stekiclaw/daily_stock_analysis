@@ -537,5 +537,262 @@ class RunDiagnosticsP2TestCase(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 500)
 
 
+def _provider_diagnostics(provider_runs: list[dict]) -> dict:
+    """Minimal diagnostics payload carrying only provider evidence."""
+    return {
+        "trace_id": "trace-provider",
+        "query_id": "query-provider",
+        "stock_code": "MSFT",
+        "trigger_source": "api",
+        "provider_runs": provider_runs,
+        "llm_runs": [
+            {
+                "trace_id": "trace-provider",
+                "model": "gpt-5.6-sol",
+                "call_type": "analysis",
+                "success": True,
+            }
+        ],
+    }
+
+
+class ProviderFallbackVersusSupplementTestCase(unittest.TestCase):
+    """`_provider_component` must separate real fallback from field supplements.
+
+    Shapes below are copied from real analysis history records:
+    - MSFT (record 521): primary succeeded first, later attempts only supplement
+      missing fields (`DataFetcherManager._supplement_quote`).
+    - NBIS (record 497): two daily sources failed before anything succeeded.
+    """
+
+    def test_supplement_attempts_after_first_success_report_ok_with_primary_provider(self) -> None:
+        summary = build_run_diagnostic_summary(
+            context_snapshot={
+                "diagnostics": _provider_diagnostics(
+                    [
+                        {
+                            "data_type": "realtime_quote",
+                            "provider": "YfinanceFetcher",
+                            "operation": "get_realtime_quote",
+                            "success": True,
+                            "record_count": 1,
+                        },
+                        {
+                            "data_type": "realtime_quote",
+                            "provider": "LongbridgeFetcher",
+                            "operation": "get_realtime_quote",
+                            "success": False,
+                            "error_type": "unavailable",
+                            "error_message_sanitized": "fetcher unavailable",
+                        },
+                        {
+                            "data_type": "realtime_quote",
+                            "provider": "FinnhubFetcher",
+                            "operation": "get_realtime_quote",
+                            "success": True,
+                            "record_count": 1,
+                        },
+                        {
+                            "data_type": "realtime_quote",
+                            "provider": "AlphaVantageFetcher",
+                            "operation": "get_realtime_quote",
+                            "success": False,
+                            "error_type": "empty",
+                            "error_message_sanitized": "empty or incomplete quote",
+                        },
+                    ]
+                )
+            },
+            raw_result={"success": True, "model_used": "gpt-5.6-sol"},
+            report_saved=True,
+        )
+
+        quote = summary["components"]["realtime_quote"]
+        self.assertEqual(quote["status"], "ok")
+        self.assertEqual(quote["details"]["provider"], "YfinanceFetcher")
+        self.assertEqual(quote["details"]["attempts"], 4)
+        self.assertEqual(quote["details"]["skipped_providers"], ["LongbridgeFetcher"])
+        self.assertNotIn("failed_providers", quote["details"])
+        self.assertIn("YfinanceFetcher", quote["message"])
+        self.assertNotIn("前置数据源失败", quote["message"])
+        self.assertNotEqual(summary["status"], "degraded")
+
+    def test_failures_before_first_success_still_report_fallback_as_degraded(self) -> None:
+        summary = build_run_diagnostic_summary(
+            context_snapshot={
+                "diagnostics": _provider_diagnostics(
+                    [
+                        {
+                            "data_type": "daily_data",
+                            "provider": "FinnhubFetcher",
+                            "operation": "get_daily_data",
+                            "success": False,
+                            "error_type": "HTTPError",
+                            "error_message_sanitized": "[Finnhub] HTTP response 403",
+                            "fallback_to": "AlphaVantageFetcher",
+                        },
+                        {
+                            "data_type": "daily_data",
+                            "provider": "AlphaVantageFetcher",
+                            "operation": "get_daily_data",
+                            "success": False,
+                            "error_type": "DataFetchError",
+                            "error_message_sanitized": "no time series",
+                            "fallback_to": "YfinanceFetcher",
+                        },
+                        {
+                            "data_type": "daily_data",
+                            "provider": "YfinanceFetcher",
+                            "operation": "get_daily_data",
+                            "success": True,
+                            "record_count": 30,
+                        },
+                    ]
+                )
+            },
+            raw_result={"success": True, "model_used": "gpt-5.6-sol"},
+            report_saved=True,
+        )
+
+        daily = summary["components"]["daily_data"]
+        self.assertEqual(daily["status"], "degraded")
+        self.assertEqual(daily["details"]["provider"], "YfinanceFetcher")
+        self.assertEqual(daily["details"]["record_count"], 30)
+        self.assertEqual(
+            daily["details"]["failed_providers"],
+            ["FinnhubFetcher", "AlphaVantageFetcher"],
+        )
+        self.assertEqual(daily["details"]["fallback_to"], "AlphaVantageFetcher")
+        self.assertIn("前置数据源失败后已继续", daily["message"])
+        self.assertEqual(summary["status"], "degraded")
+
+    def test_unconfigured_source_before_success_is_skipped_not_degraded(self) -> None:
+        summary = build_run_diagnostic_summary(
+            context_snapshot={
+                "diagnostics": _provider_diagnostics(
+                    [
+                        {
+                            "data_type": "realtime_quote",
+                            "provider": "LongbridgeFetcher",
+                            "operation": "get_realtime_quote",
+                            "success": False,
+                            "error_type": "unavailable",
+                            "error_message_sanitized": "数据源未配置或暂不可用",
+                        },
+                        {
+                            "data_type": "realtime_quote",
+                            "provider": "YfinanceFetcher",
+                            "operation": "get_realtime_quote",
+                            "success": True,
+                            "record_count": 1,
+                        },
+                    ]
+                )
+            },
+            raw_result={"success": True, "model_used": "gpt-5.6-sol"},
+            report_saved=True,
+        )
+
+        quote = summary["components"]["realtime_quote"]
+        self.assertEqual(quote["status"], "ok")
+        self.assertEqual(quote["details"]["provider"], "YfinanceFetcher")
+        self.assertEqual(quote["details"]["skipped_providers"], ["LongbridgeFetcher"])
+
+    def test_all_sources_unavailable_is_still_failed(self) -> None:
+        summary = build_run_diagnostic_summary(
+            context_snapshot={
+                "diagnostics": _provider_diagnostics(
+                    [
+                        {
+                            "data_type": "realtime_quote",
+                            "provider": "LongbridgeFetcher",
+                            "operation": "get_realtime_quote",
+                            "success": False,
+                            "error_type": "unavailable",
+                            "error_message_sanitized": "数据源未配置或暂不可用",
+                        },
+                    ]
+                )
+            },
+            raw_result={"success": True, "model_used": "gpt-5.6-sol"},
+            report_saved=True,
+        )
+
+        quote = summary["components"]["realtime_quote"]
+        self.assertEqual(quote["status"], "failed")
+        self.assertEqual(quote["details"]["error_type"], "unavailable")
+
+    def test_cache_sourced_daily_run_reports_local_storage_instead_of_unknown(self) -> None:
+        summary = build_run_diagnostic_summary(
+            context_snapshot={
+                "diagnostics": _provider_diagnostics(
+                    [
+                        {
+                            "data_type": "daily_data",
+                            "provider": "LocalStorage",
+                            "operation": "resume_local_daily_data",
+                            "success": True,
+                            "latency_ms": 1,
+                            "cache_hit": True,
+                            "data_date": "2026-08-28",
+                        },
+                    ]
+                )
+            },
+            raw_result={"success": True, "model_used": "gpt-5.6-sol"},
+            report_saved=True,
+        )
+
+        daily = summary["components"]["daily_data"]
+        self.assertEqual(daily["status"], "ok")
+        self.assertTrue(daily["details"]["cache_hit"])
+        self.assertEqual(daily["details"]["provider"], "LocalStorage")
+        self.assertEqual(daily["details"]["data_date"], "2026-08-28")
+        self.assertIn("本地存储缓存", daily["message"])
+        self.assertIn("2026-08-28", daily["message"])
+        self.assertNotIn("未记录诊断信息", daily["message"])
+        self.assertNotEqual(summary["status"], "degraded")
+
+    def test_cache_sourced_daily_run_followed_by_realtime_failure_stays_ok(self) -> None:
+        """A cache run must not be misread as a failing or fallback source."""
+        summary = build_run_diagnostic_summary(
+            context_snapshot={
+                "diagnostics": _provider_diagnostics(
+                    [
+                        {
+                            "data_type": "daily_data",
+                            "provider": "LocalStorage",
+                            "operation": "resume_local_daily_data",
+                            "success": True,
+                            "cache_hit": True,
+                            "data_date": "2026-08-28",
+                        },
+                        {
+                            "data_type": "realtime_quote",
+                            "provider": "YfinanceFetcher",
+                            "operation": "get_realtime_quote",
+                            "success": True,
+                            "record_count": 1,
+                        },
+                        {
+                            "data_type": "realtime_quote",
+                            "provider": "AlphaVantageFetcher",
+                            "operation": "get_realtime_quote",
+                            "success": False,
+                            "error_type": "empty",
+                            "error_message_sanitized": "empty or incomplete quote",
+                        },
+                    ]
+                )
+            },
+            raw_result={"success": True, "model_used": "gpt-5.6-sol"},
+            report_saved=True,
+        )
+
+        self.assertEqual(summary["components"]["daily_data"]["status"], "ok")
+        self.assertEqual(summary["components"]["realtime_quote"]["status"], "ok")
+        self.assertEqual(summary["status"], "normal")
+
+
 if __name__ == "__main__":
     unittest.main()

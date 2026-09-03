@@ -106,18 +106,24 @@ def messages_to_responses_input(
                 )
             for call in message.get("tool_calls") or []:
                 arguments = call.get("arguments")
-                items.append(
-                    {
-                        "type": "function_call",
-                        "call_id": str(call.get("id") or ""),
-                        "name": str(call.get("name") or ""),
-                        # The wire format is a JSON string even though the loop
-                        # keeps arguments as a dict.
-                        "arguments": arguments
-                        if isinstance(arguments, str)
-                        else json.dumps(arguments or {}, ensure_ascii=False),
-                    }
-                )
+                provider_fields = call.get("provider_specific_fields")
+                provider_fields = provider_fields if isinstance(provider_fields, dict) else {}
+                call_item = {
+                    "type": "function_call",
+                    "call_id": str(call.get("id") or ""),
+                    "name": str(call.get("name") or ""),
+                    # The wire format is a JSON string even though the loop
+                    # keeps arguments as a dict.
+                    "arguments": arguments
+                    if isinstance(arguments, str)
+                    else json.dumps(arguments or {}, ensure_ascii=False),
+                }
+                output_item_id = provider_fields.get("responses_output_item_id")
+                if output_item_id:
+                    # ``call_id`` links the tool result; ``id`` identifies the
+                    # original Responses output item and must also be replayed.
+                    call_item["id"] = str(output_item_id)
+                items.append(call_item)
             continue
 
         # Anything else (user, and unknown roles) is sent as user input.
@@ -148,11 +154,18 @@ def _parse_tool_calls(raw_calls: List[Dict[str, Any]]) -> List[ToolCall]:
                 arguments = {}
         if not isinstance(arguments, dict):
             arguments = {}
+        call_id = str(raw.get("call_id") or raw.get("id") or "")
+        output_item_id = str(raw.get("id") or "")
         calls.append(
             ToolCall(
-                id=str(raw.get("call_id") or raw.get("id") or ""),
+                id=call_id,
                 name=str(raw.get("name") or ""),
                 arguments=arguments,
+                provider_specific_fields=(
+                    {"responses_output_item_id": output_item_id}
+                    if output_item_id
+                    else {}
+                ),
             )
         )
     return calls

@@ -5,6 +5,7 @@ Shared data parsing and normalization helpers.
 
 import json
 import math
+from numbers import Integral, Real
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -79,7 +80,7 @@ def _normalize_belong_boards(value: Any) -> List[Dict[str, Any]]:
 
 
 def _safe_float(value: Any) -> Optional[float]:
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     try:
         if isinstance(value, str):
@@ -88,10 +89,12 @@ def _safe_float(value: Any) -> Optional[float]:
                 return None
             if text.endswith("%"):
                 text = text[:-1].strip()
-            return float(text)
-        return float(value)
+            numeric_value = float(text)
+        else:
+            numeric_value = float(value)
     except (TypeError, ValueError):
         return None
+    return numeric_value if math.isfinite(numeric_value) else None
 
 
 def _safe_int(value: Any) -> Optional[int]:
@@ -171,7 +174,40 @@ def _extract_ranking_payload_from_block(value: Any) -> Optional[Dict[str, Any]]:
 
 
 def _is_empty_value(value: Any) -> bool:
-    return value is None or value == "" or value == [] or value == {}
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    # NumPy scalars/arrays do not consistently implement Python's ``Real`` or
+    # sequence protocols. Normalize them before deciding whether an overlay is
+    # meaningful so an all-NaN ndarray cannot replace a finite fallback list.
+    if type(value).__module__.startswith("numpy"):
+        if hasattr(value, "tolist"):
+            normalized = value.tolist()
+        elif hasattr(value, "item"):
+            normalized = value.item()
+        else:
+            normalized = value
+        if normalized is not value:
+            return _is_empty_value(normalized)
+    if isinstance(value, Real):
+        return not math.isfinite(float(value))
+    if isinstance(value, str):
+        stripped = value.strip()
+        return not stripped or stripped.lower() in {
+            "nan",
+            "inf",
+            "+inf",
+            "-inf",
+            "infinity",
+            "+infinity",
+            "-infinity",
+        }
+    if isinstance(value, (list, tuple)):
+        return len(value) == 0 or all(_is_empty_value(item) for item in value)
+    if isinstance(value, dict):
+        return len(value) == 0
+    return False
 
 
 def _deep_merge_dicts(*values: Any) -> Optional[Dict[str, Any]]:
@@ -216,11 +252,180 @@ def extract_fundamental_context(
         if isinstance(raw_top_level, dict):
             top_level_fundamental = raw_top_level
 
-    return _deep_merge_dicts(
+    merged = _deep_merge_dicts(
         fallback_obj,
         top_level_fundamental,
         enhanced_fundamental,
     )
+    normalized = normalize_json_safe_value(merged)
+    return normalized if isinstance(normalized, dict) else None
+
+
+_NULLISH_DISPLAY_TOKENS = {
+    "none",
+    "null",
+    "nan",
+    "inf",
+    "+inf",
+    "-inf",
+    "infinity",
+    "+infinity",
+    "-infinity",
+    "n/a",
+    "na",
+    "-",
+    "--",
+    "—",
+}
+_NONFINITE_JSON_STRING_TOKENS = {
+    "nan",
+    "inf",
+    "+inf",
+    "-inf",
+    "infinity",
+    "+infinity",
+    "-infinity",
+}
+
+
+def normalize_json_safe_value(value: Any) -> Any:
+    """Recursively convert report/API payload values to strict JSON types.
+
+    Financial providers commonly return pandas/NumPy scalars and may carry
+    NaN/Infinity sentinels. Python's default JSON encoder accepts those floats,
+    but they are not valid JSON and can leak through API responses. This helper
+    preserves finite values and booleans, converts tuples/arrays to lists, and
+    maps non-finite numbers (including exact string sentinels) to ``None``.
+    """
+    if isinstance(value, dict):
+        return {
+            key: normalize_json_safe_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [normalize_json_safe_value(item) for item in value]
+    if isinstance(value, bool):
+        return value
+    if type(value).__module__.startswith("numpy"):
+        if hasattr(value, "tolist"):
+            normalized = value.tolist()
+        elif hasattr(value, "item"):
+            normalized = value.item()
+        else:
+            normalized = value
+        if normalized is not value:
+            return normalize_json_safe_value(normalized)
+    if isinstance(value, Integral):
+        return int(value)
+    if isinstance(value, Real):
+        numeric_value = float(value)
+        return numeric_value if math.isfinite(numeric_value) else None
+    if isinstance(value, str) and value.strip().lower() in _NONFINITE_JSON_STRING_TOKENS:
+        return None
+    return value
+
+
+def display_value_or_na(value: Any, placeholder: str = "N/A") -> str:
+    """Render a dashboard/report field, mapping missing values to a placeholder.
+
+    ``dict.get(key, "N/A")`` only fires when the key is *absent*. The decision
+    dashboard is produced by the model and routinely carries an explicit ``null``
+    when a provider cannot supply a metric（例如部分美股或 ETF 缺少流通股本时无法
+    计算换手率），所以默认值永远不会生效，报告里会直接渲染出字面量 ``None``。
+
+    因此展示层统一走本函数：``None`` / 非有限浮点数 / 空串 / 以及模型可能吐出的
+    ``"none"``、``"null"`` 等占位字符串都渲染为 ``placeholder``，其余原样输出。
+    """
+    if value is None:
+        return placeholder
+    if isinstance(value, Real) and not isinstance(value, bool):
+        if not math.isfinite(float(value)):
+            return placeholder
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() in _NULLISH_DISPLAY_TOKENS:
+            return placeholder
+        return text
+    return str(value)
+
+
+def display_numeric_with_suffix(
+    value: Any,
+    suffix: str,
+    placeholder: str = "N/A",
+) -> str:
+    """Append a unit only when *value* is a real finite number.
+
+    Model-produced dashboard fields occasionally contain explanatory text such as
+    ``"数据缺失，无法判断"`` despite being nominally numeric. Unconditionally
+    appending ``%`` or ``/100`` turns that into misleading output such as
+    ``"数据缺失，无法判断%"``; missing values similarly became ``"N/A%"``.
+    Numeric values and numeric strings keep their original display text and receive
+    the suffix exactly once. Missing or non-numeric explanatory values are rendered
+    without a unit.
+    """
+    rendered = display_value_or_na(value, placeholder)
+    if rendered == placeholder or isinstance(value, bool):
+        return rendered
+
+    numeric_text = rendered
+    if suffix and numeric_text.endswith(suffix):
+        numeric_text = numeric_text[: -len(suffix)].rstrip()
+
+    try:
+        numeric_value = float(numeric_text.replace(",", ""))
+    except (TypeError, ValueError):
+        return rendered
+    if not math.isfinite(numeric_value):
+        return placeholder
+    return f"{numeric_text}{suffix}"
+
+
+def display_fraction_as_percent(
+    value: Any,
+    precision: int = 0,
+    placeholder: str = "N/A",
+) -> str:
+    """Render a finite 0-1 fraction as a percentage for report boundaries.
+
+    Numeric strings are accepted. A string already carrying ``%`` is treated as
+    percentage points rather than multiplied again. Explanatory text is preserved
+    without an appended unit; missing and non-finite values use ``placeholder``.
+    """
+    rendered = display_value_or_na(value, placeholder)
+    if rendered == placeholder or isinstance(value, bool):
+        return rendered
+
+    has_percent_suffix = rendered.endswith("%")
+    numeric_text = rendered[:-1].strip() if has_percent_suffix else rendered
+    try:
+        numeric_value = float(numeric_text.replace(",", ""))
+    except (TypeError, ValueError):
+        return rendered
+    if not math.isfinite(numeric_value):
+        return placeholder
+    percentage = numeric_value if has_percent_suffix else numeric_value * 100
+    return f"{percentage:.{max(0, int(precision))}f}%"
+
+
+def _snapshot_official_daily_bar(snapshot_obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return the official (non-estimated) daily bar stored in a snapshot, if any."""
+    enhanced = snapshot_obj.get("enhanced_context")
+    if not isinstance(enhanced, dict):
+        return None
+    today = enhanced.get("today")
+    if not isinstance(today, dict) or not today:
+        return None
+    # 实时估算 bar 不是官方日线，不能拿来纠正实时报价。
+    if today.get("is_estimated"):
+        return None
+    return today
+
+
+def _snapshot_is_confirmed_non_trading_day(snapshot_obj: Dict[str, Any]) -> bool:
+    """Only an explicitly persisted ``is_trading_day is False`` counts (fail open)."""
+    summary = snapshot_obj.get("market_phase_summary")
+    return isinstance(summary, dict) and summary.get("is_trading_day") is False
 
 
 def extract_realtime_detail_fields(context_snapshot: Any) -> Dict[str, Any]:
@@ -229,31 +434,69 @@ def extract_realtime_detail_fields(context_snapshot: Any) -> Dict[str, Any]:
 
     Supports both the standard `enhanced_context.realtime` layout and the
     agent-mode top-level `realtime_quote` compatibility shape.
+
+    非交易日校正：这两个字段是 API `meta.current_price` / `meta.change_pct` 的取数来源，
+    也就是历史列表卡片和报告表头显示的数字。行情快照在收盘后仍会返回一份实时报价，
+    其 `change_pct` 由 provider 自带的 `pre_close` 反推，而该 `pre_close` 可能落后一个
+    交易日，于是同一份报告的表头和正文会给出两个涨跌幅
+    （实例：MSFT 2026-08-28，provider `pre_close=503.09` → `+2.08%`，
+    官方日线前收 505.06 → `+1.68%`）。因此当快照中的 `market_phase_summary`
+    明确判定 `is_trading_day is False` 时，改用官方日线的 `close` / `pct_chg`，
+    与 pipeline 侧 `resolve_result_price_change` 保持同一语义；phase 未知或
+    官方日线缺字段时保持失败开放，沿用实时报价。
     """
     snapshot_obj = parse_json_field(context_snapshot)
     if not isinstance(snapshot_obj, dict):
         return {"current_price": None, "change_pct": None}
 
-    current_price = None
-    change_pct = None
+    current_price_candidates: List[Any] = []
+    change_pct_candidates: List[Any] = []
 
     enhanced = snapshot_obj.get("enhanced_context")
     if isinstance(enhanced, dict):
         realtime = enhanced.get("realtime")
         if isinstance(realtime, dict):
-            current_price = realtime.get("price")
-            change_pct = realtime.get("change_pct")
+            current_price_candidates.append(realtime.get("price"))
+            change_pct_candidates.extend(
+                (realtime.get("change_pct"), realtime.get("pct_chg"))
+            )
 
     for field in ("realtime_quote_raw", "realtime_quote"):
         realtime_payload = snapshot_obj.get(field)
         if not isinstance(realtime_payload, dict):
             continue
-        if current_price is None:
-            current_price = realtime_payload.get("price")
-        if change_pct is None:
-            change_pct = realtime_payload.get("change_pct")
-        if change_pct is None:
-            change_pct = realtime_payload.get("pct_chg")
+        current_price_candidates.append(realtime_payload.get("price"))
+        change_pct_candidates.extend(
+            (realtime_payload.get("change_pct"), realtime_payload.get("pct_chg"))
+        )
+
+    current_price = next(
+        (
+            numeric_value
+            for value in current_price_candidates
+            if (numeric_value := _safe_float(value)) is not None
+        ),
+        None,
+    )
+    change_pct = next(
+        (
+            numeric_value
+            for value in change_pct_candidates
+            if (numeric_value := _safe_float(value)) is not None
+        ),
+        None,
+    )
+
+    if _snapshot_is_confirmed_non_trading_day(snapshot_obj):
+        official = _snapshot_official_daily_bar(snapshot_obj)
+        if official is not None:
+            official_close = _safe_float(official.get("close"))
+            official_change_pct = _safe_float(official.get("pct_chg"))
+            # Invalid official fields must not erase an otherwise valid quote.
+            if official_close is not None:
+                current_price = official_close
+            if official_change_pct is not None:
+                change_pct = official_change_pct
 
     return {
         "current_price": current_price,
