@@ -2,6 +2,7 @@ import type React from 'react';
 import { useCallback, useEffect, useState } from 'react';
 import { historyApi } from '../../api/history';
 import type { ReportLanguage } from '../../types/analysis';
+import { copyToClipboard } from '../../utils/clipboard';
 import { markdownToPlainText } from '../../utils/markdown';
 import { getReportText, normalizeReportLanguage } from '../../utils/reportLanguage';
 import { Tooltip } from '../common/Tooltip';
@@ -32,24 +33,18 @@ export const ReportMarkdownPanel: React.FC<ReportMarkdownPanelProps> = ({
 
   const handleCopyMarkdown = useCallback(async () => {
     if (!content) return;
-    try {
-      await navigator.clipboard.writeText(content);
+    if (await copyToClipboard(content)) {
       setCopiedType('markdown');
       setTimeout(() => setCopiedType(null), 2000);
-    } catch (error) {
-      console.error('Copy failed:', error);
     }
   }, [content]);
 
   const handleCopyPlainText = useCallback(async () => {
     if (!content) return;
-    try {
-      const plainText = markdownToPlainText(content);
-      await navigator.clipboard.writeText(plainText);
+    const plainText = markdownToPlainText(content);
+    if (await copyToClipboard(plainText)) {
       setCopiedType('text');
       setTimeout(() => setCopiedType(null), 2000);
-    } catch (error) {
-      console.error('Copy failed:', error);
     }
   }, [content]);
 

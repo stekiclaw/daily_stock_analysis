@@ -12,8 +12,10 @@ and the Agent path keeps running on LiteLLM.
 
 from __future__ import annotations
 
+import threading
 import uuid
-from typing import Any, Callable, Dict, Optional
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Iterator, Optional
 
 from src.llm import codex_oauth
 from src.llm.backend_registry import CODEX_OAUTH_BACKEND_ID
@@ -29,6 +31,32 @@ DEFAULT_TIMEOUT_SECONDS = 300
 MAX_TIMEOUT_SECONDS = 3600
 DEFAULT_MAX_OUTPUT_BYTES = 1048576
 MAX_OUTPUT_BYTES = 33554432
+DEFAULT_MAX_CONCURRENCY = 1
+MAX_CONCURRENCY = 16
+
+
+class _GlobalGenerationGate:
+    """Process-wide gate shared by every Codex OAuth backend instance."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._active = 0
+
+    @contextmanager
+    def slot(self, limit: int) -> Iterator[None]:
+        with self._condition:
+            while self._active >= limit:
+                self._condition.wait()
+            self._active += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active -= 1
+                self._condition.notify_all()
+
+
+_GENERATION_GATE = _GlobalGenerationGate()
 
 # Reason codes from src.llm.codex_oauth mapped onto DSA's structured error
 # contract. ``retryable`` / ``fallbackable`` follow the local CLI backend's
@@ -115,6 +143,16 @@ class CodexOAuthGenerationBackend(GenerationBackend):
             MAX_OUTPUT_BYTES,
         )
 
+    @property
+    def _max_concurrency(self) -> int:
+        return min(
+            _positive_int(
+                getattr(self._config, "generation_backend_max_concurrency", None),
+                DEFAULT_MAX_CONCURRENCY,
+            ),
+            MAX_CONCURRENCY,
+        )
+
     def get_config_error(self) -> Optional[GenerationError]:
         """Validate the credential without spending a real generation call."""
         try:
@@ -126,6 +164,28 @@ class CodexOAuthGenerationBackend(GenerationBackend):
     # --- generation ---------------------------------------------------------
 
     def generate(
+        self,
+        prompt: str,
+        generation_config: Dict[str, Any],
+        *,
+        system_prompt: Optional[str] = None,
+        stream: bool = False,
+        stream_progress_callback: Optional[Callable[[int], None]] = None,
+        response_validator: Optional[Callable[[str], None]] = None,
+        audit_context: Optional[Dict[str, Any]] = None,
+    ) -> GenerationResult:
+        with _GENERATION_GATE.slot(self._max_concurrency):
+            return self._generate_once(
+                prompt,
+                generation_config,
+                system_prompt=system_prompt,
+                stream=stream,
+                stream_progress_callback=stream_progress_callback,
+                response_validator=response_validator,
+                audit_context=audit_context,
+            )
+
+    def _generate_once(
         self,
         prompt: str,
         generation_config: Dict[str, Any],
@@ -152,6 +212,7 @@ class CodexOAuthGenerationBackend(GenerationBackend):
             "stream_degraded": bool(stream),
             "timeout_seconds": self._timeout_seconds,
             "max_output_bytes": self._max_output_bytes,
+            "max_concurrency": self._max_concurrency,
         }
 
         self._emit_progress(stream_progress_callback, 0)

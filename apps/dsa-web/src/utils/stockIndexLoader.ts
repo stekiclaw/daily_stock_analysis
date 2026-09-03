@@ -5,6 +5,7 @@
  */
 
 import type { StockIndexData, StockIndexItem, StockIndexTuple } from '../types/stockIndex';
+import { withAppBasePath } from './constants';
 import { INDEX_FIELD } from './stockIndexFields';
 
 export interface IndexLoadResult {
@@ -26,7 +27,8 @@ export interface IndexLoadResult {
 export async function loadStockIndex(): Promise<IndexLoadResult> {
   try {
     // Add time parameter to bypass cache (in case the backend doesn't handle ETag/Cache-Control)
-    const response = await fetch(`/stocks.index.json?_t=${Math.floor(Date.now() / 3600000)}`);
+    const indexUrl = withAppBasePath('/stocks.index.json');
+    const response = await fetch(`${indexUrl}?_t=${Math.floor(Date.now() / 3600000)}`);
 
     if (!response.ok) {
       throw new Error(`Failed to load index: ${response.status} ${response.statusText}`);

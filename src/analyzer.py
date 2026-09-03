@@ -566,6 +566,60 @@ _STRUCTURAL_RISK_PHRASE_HINTS = (
     "default",
 )
 
+# Trading currency per market. A price rendered as "元" reads as RMB, so a US or
+# HK quote must carry its own unit rather than inherit the A-share default.
+_MARKET_CURRENCY = {
+    "cn": "CNY",
+    "hk": "HKD",
+    "us": "USD",
+    "jp": "JPY",
+    "kr": "KRW",
+    "tw": "TWD",
+}
+
+# Same wording as NotificationService._CURRENCY_SUFFIX so a report and the prompt
+# that produced it never disagree about what "元" means.
+_CURRENCY_UNIT_LABEL = {
+    "CNY": "元",
+    "RMB": "元",
+    "CNH": "元",
+    "HKD": "港元",
+    "USD": "美元",
+    "JPY": "日元",
+    "KRW": "韩元",
+    "TWD": "新台币",
+}
+
+
+def resolve_market_currency(
+    stock_code: Optional[str],
+    explicit_currency: Optional[str] = None,
+) -> str:
+    """Resolve the quote currency, preferring what the data source reported."""
+    explicit = str(explicit_currency or "").strip().upper()
+    if explicit:
+        return explicit
+    return _MARKET_CURRENCY.get(detect_market(stock_code), "CNY")
+
+
+def currency_unit_label(currency: Optional[str]) -> str:
+    """Chinese unit word for a currency code; unknown codes keep the 元 default."""
+    return _CURRENCY_UNIT_LABEL.get(str(currency or "").strip().upper(), "元")
+
+
+def _context_quote_currency(context: Dict[str, Any]) -> str:
+    """Pick the currency for a prompt context: source value first, market second."""
+    if not isinstance(context, dict):
+        return "CNY"
+    realtime = context.get("realtime")
+    explicit = None
+    if isinstance(realtime, dict):
+        explicit = realtime.get("currency")
+    if not explicit:
+        explicit = context.get("currency")
+    return resolve_market_currency(context.get("code"), explicit)
+
+
 _CAPITAL_FLOW_UNAVAILABLE_STATUS = {
     "not_supported",
     "not supported",
@@ -1077,7 +1131,10 @@ def stabilize_decision_with_structure(
         flow_bias, flow_reason = _capital_flow_bias_with_status(fundamental_context)
         if flow_bias == "unavailable":
             if isinstance(fundamental_context, dict) and "capital_flow" in fundamental_context:
-                if decision_type == "buy" or advice_decision_type == "buy":
+                should_downgrade_buy = (
+                    decision_type == "buy" or advice_decision_type == "buy"
+                ) and not _capital_flow_is_intentionally_unsupported(flow_reason)
+                if should_downgrade_buy:
                     _downgrade_buy_without_capital_flow(
                         result,
                         language,
@@ -1087,6 +1144,9 @@ def stabilize_decision_with_structure(
                         flow_status=flow_reason,
                     )
                 else:
+                    # Provider coverage gaps are not negative evidence. Preserve
+                    # an otherwise valid decision and only disclose that this
+                    # calibration could not be applied.
                     _set_decision_stability_unavailable(
                         result,
                         language,
@@ -1352,6 +1412,11 @@ def _capital_flow_status_for_stability(reason: str, language: str) -> str:
     if "empty_stock_flow" in normalized or "missing" in normalized:
         return "资金流数据缺失" if language == "zh" else "capital flow data unavailable"
     return "资金流数据不可用" if language == "zh" else "capital flow unavailable"
+
+
+def _capital_flow_is_intentionally_unsupported(reason: str) -> bool:
+    normalized = str(reason or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized in {"not_supported", "unsupported"}
 
 
 def _set_decision_stability_unavailable(
@@ -2004,10 +2069,10 @@ class GeminiAnalyzer:
 
         "battle_plan": {
             "sniper_points": {
-                "ideal_buy": "理想买入点：XX元（在MA5附近）",
-                "secondary_buy": "次优买入点：XX元（在MA10附近）",
-                "stop_loss": "止损位：XX元（跌破MA20或X%）",
-                "take_profit": "目标位：XX元（前高/整数关口）"
+                "ideal_buy": "理想买入点：XX{currency_placeholder}（在MA5附近）",
+                "secondary_buy": "次优买入点：XX{currency_placeholder}（在MA10附近）",
+                "stop_loss": "止损位：XX{currency_placeholder}（跌破MA20或X%）",
+                "take_profit": "目标位：XX{currency_placeholder}（前高/整数关口）"
             },
             "position_strategy": {
                 "suggested_position": "建议仓位：X成",
@@ -2192,10 +2257,10 @@ class GeminiAnalyzer:
 
         "battle_plan": {
             "sniper_points": {
-                "ideal_buy": "理想入场位：XX元（满足主要技能触发条件）",
-                "secondary_buy": "次优入场位：XX元（更保守或确认后执行）",
-                "stop_loss": "止损位：XX元（失效条件或X%风险）",
-                "take_profit": "目标位：XX元（按阻力位/风险回报比制定）"
+                "ideal_buy": "理想入场位：XX{currency_placeholder}（满足主要技能触发条件）",
+                "secondary_buy": "次优入场位：XX{currency_placeholder}（更保守或确认后执行）",
+                "stop_loss": "止损位：XX{currency_placeholder}（失效条件或X%风险）",
+                "take_profit": "目标位：XX{currency_placeholder}（按阻力位/风险回报比制定）"
             },
             "position_strategy": {
                 "suggested_position": "建议仓位：X成",
@@ -2396,12 +2461,17 @@ class GeminiAnalyzer:
         lang = normalize_report_language(report_language)
         market_role = get_market_role(stock_code, lang)
         market_guidelines = get_market_guidelines(stock_code, lang)
+        # Price examples in the battle plan must name the market's own currency;
+        # a hardcoded 元 tells the model a US target price is quoted in RMB.
+        price_unit = currency_unit_label(resolve_market_currency(stock_code))
         skill_instructions, default_skill_policy, use_legacy_default_prompt = self._get_skill_prompt_sections()
         if use_legacy_default_prompt:
             base_prompt = self.LEGACY_DEFAULT_SYSTEM_PROMPT.replace(
                 "{market_placeholder}", market_role
             ).replace(
                 "{guidelines_placeholder}", market_guidelines
+            ).replace(
+                "{currency_placeholder}", price_unit
             )
         else:
             skills_section = ""
@@ -2415,6 +2485,7 @@ class GeminiAnalyzer:
                 .replace("{guidelines_placeholder}", market_guidelines)
                 .replace("{default_skill_policy_section}", default_skill_policy_section)
                 .replace("{skills_section}", skills_section)
+                .replace("{currency_placeholder}", price_unit)
             )
         if lang == "en":
             return base_prompt + """
@@ -4059,6 +4130,10 @@ class GeminiAnalyzer:
         unknown_text = get_unknown_text(report_language)
         no_data_text = get_no_data_text(report_language)
         quote_section_title, close_price_label = _phase_aware_quote_labels(context)
+        # Prices, market value and turnover are all quoted in the instrument's own
+        # currency; falling back to 元 would label a US or HK quote as RMB.
+        quote_currency = _context_quote_currency(context)
+        price_unit = currency_unit_label(quote_currency)
         hide_regular_session_ohlc = _should_hide_regular_session_ohlc(context)
         realtime_overlay_quote = hide_regular_session_ohlc and _today_has_realtime_overlay(today)
         pct_chg_label = "实时涨跌幅" if realtime_overlay_quote else "涨跌幅"
@@ -4066,14 +4141,14 @@ class GeminiAnalyzer:
         amount_label = "实时成交额" if realtime_overlay_quote else "成交额"
         quote_rows = [
             f"| {close_price_label} | "
-            f"{display_numeric_with_suffix(today.get('close'), ' 元')} |",
+            f"{display_numeric_with_suffix(today.get('close'), f' {price_unit}')} |",
         ]
         if not hide_regular_session_ohlc:
             quote_rows.extend(
                 [
-                    f"| 开盘价 | {display_numeric_with_suffix(today.get('open'), ' 元')} |",
-                    f"| 最高价 | {display_numeric_with_suffix(today.get('high'), ' 元')} |",
-                    f"| 最低价 | {display_numeric_with_suffix(today.get('low'), ' 元')} |",
+                    f"| 开盘价 | {display_numeric_with_suffix(today.get('open'), f' {price_unit}')} |",
+                    f"| 最高价 | {display_numeric_with_suffix(today.get('high'), f' {price_unit}')} |",
+                    f"| 最低价 | {display_numeric_with_suffix(today.get('low'), f' {price_unit}')} |",
                 ]
             )
         quote_rows.extend(
@@ -4081,7 +4156,7 @@ class GeminiAnalyzer:
                 f"| {pct_chg_label} | "
                 f"{display_numeric_with_suffix(today.get('pct_chg'), '%')} |",
                 f"| {volume_label} | {self._format_volume(today.get('volume'))} |",
-                f"| {amount_label} | {self._format_amount(today.get('amount'))} |",
+                f"| {amount_label} | {self._format_amount(today.get('amount'), quote_currency)} |",
             ]
         )
         quote_rows_text = "\n".join(quote_rows)
@@ -4141,13 +4216,13 @@ class GeminiAnalyzer:
 ### 实时行情增强数据
 | 指标 | 数值 | 解读 |
 |------|------|------|
-| 当前价格 | {display_numeric_with_suffix(rt.get('price'), ' 元')} | |
+| 当前价格 | {display_numeric_with_suffix(rt.get('price'), f' {price_unit}')} | |
 | **量比** | **{display_value_or_na(rt.get('volume_ratio'))}** | {display_value_or_na(rt.get('volume_ratio_desc'), '')} |
 | **换手率** | **{display_numeric_with_suffix(rt.get('turnover_rate'), '%')}** | |
 | 市盈率(动态) | {display_value_or_na(rt.get('pe_ratio'))} | |
 | 市净率 | {display_value_or_na(rt.get('pb_ratio'))} | |
-| 总市值 | {self._format_amount(rt.get('total_mv'))} | |
-| 流通市值 | {self._format_amount(rt.get('circ_mv'))} | |
+| 总市值 | {self._format_amount(rt.get('total_mv'), quote_currency)} | |
+| 流通市值 | {self._format_amount(rt.get('circ_mv'), quote_currency)} | |
 | 60日涨跌幅 | {display_numeric_with_suffix(rt.get('change_60d'), '%')} | 中期表现 |
 """
 
@@ -4300,7 +4375,7 @@ class GeminiAnalyzer:
 | 指标 | 数值 | 健康标准 |
 |------|------|----------|
 | **获利比例** | **{_format_fraction_percent(chip.get('profit_ratio'), 1)}** | 70-90%时警惕 |
-| 平均成本 | {display_numeric_with_suffix(chip.get('avg_cost'), ' 元')} | 现价应高于5-15% |
+| 平均成本 | {display_numeric_with_suffix(chip.get('avg_cost'), f' {price_unit}')} | 现价应高于5-15% |
 | 90%筹码集中度 | {_format_fraction_percent(chip.get('concentration_90'), 2)} | <15%为集中 |
 | 70%筹码集中度 | {_format_fraction_percent(chip.get('concentration_70'), 2)} | |
 | 筹码状态 | {display_value_or_na(chip.get('chip_status'), unknown_text)} | |
@@ -4574,8 +4649,8 @@ class GeminiAnalyzer:
             return f"{numeric_volume / 1e4:.2f} 万股"
         return f"{numeric_volume:.0f} 股"
 
-    def _format_amount(self, amount: Optional[float]) -> str:
-        """格式化成交额显示"""
+    def _format_amount(self, amount: Optional[float], currency: Optional[str] = None) -> str:
+        """格式化成交额显示（按标的实际计价币种标注单位）"""
         if amount is None or isinstance(amount, bool):
             return 'N/A'
         try:
@@ -4584,11 +4659,12 @@ class GeminiAnalyzer:
             return 'N/A'
         if not math.isfinite(numeric_amount):
             return 'N/A'
+        unit = currency_unit_label(currency)
         if numeric_amount >= 1e8:
-            return f"{numeric_amount / 1e8:.2f} 亿元"
+            return f"{numeric_amount / 1e8:.2f} 亿{unit}"
         if numeric_amount >= 1e4:
-            return f"{numeric_amount / 1e4:.2f} 万元"
-        return f"{numeric_amount:.0f} 元"
+            return f"{numeric_amount / 1e4:.2f} 万{unit}"
+        return f"{numeric_amount:.0f} {unit}"
 
     def _format_percent(self, value: Optional[float]) -> str:
         """格式化百分比显示"""
@@ -4645,7 +4721,7 @@ class GeminiAnalyzer:
             "change_amount": self._format_price(change_amount),
             "amplitude": self._format_percent(amplitude),
             "volume": self._format_volume(today.get('volume')),
-            "amount": self._format_amount(today.get('amount')),
+            "amount": self._format_amount(today.get('amount'), _context_quote_currency(context)),
         }
 
         if realtime:

@@ -220,7 +220,10 @@ class CodexOAuthLoginService:
         """Sleep between polls but wake immediately when the user cancels."""
 
         def _sleep(seconds: float) -> None:
-            session.cancel_event.wait(timeout=seconds)
+            if session.cancel_event.wait(timeout=seconds):
+                # Abort the shared poll loop instead of returning immediately and
+                # letting it hammer the upstream endpoint until the deadline.
+                raise codex_oauth.CodexOAuthError("device_cancelled", "用户已取消授权")
 
         return _sleep
 

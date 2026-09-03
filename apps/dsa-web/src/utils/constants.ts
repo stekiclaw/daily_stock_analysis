@@ -1,4 +1,19 @@
 const configuredApiBaseUrl = import.meta.env.VITE_API_URL?.trim();
+const configuredAppBaseUrl = (import.meta.env.BASE_URL || '/').trim();
+
+function normalizeAppBasePath(value: string): string {
+  const path = value.replace(/^\/+|\/+$/g, '');
+  return path ? `/${path}` : '/';
+}
+
+/** Router/static/API prefix baked in by Vite (for example `/dsa`). */
+export const APP_BASE_PATH = normalizeAppBasePath(configuredAppBaseUrl);
+
+/** Prefix an application-root path without duplicating the deployment base. */
+export function withAppBasePath(path: string): string {
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  return APP_BASE_PATH === '/' ? normalizedPath : `${APP_BASE_PATH}${normalizedPath}`;
+}
 
 declare const __APP_PACKAGE_VERSION__: string | undefined;
 declare const __APP_REVISION__: string | undefined;
@@ -9,9 +24,9 @@ const DEVELOPMENT_WEB_VERSION = 'development';
 const UNKNOWN_REVISION = 'unknown';
 const UNKNOWN_BUILD_TIME = '未提供';
 
-// 默认保持同源 API，避免生产/静态部署时把请求错误打到用户本机 localhost。
-// 仅在显式提供 VITE_API_URL 时才覆盖默认行为。
-export const API_BASE_URL = configuredApiBaseUrl || '';
+// 默认保持同源 API，并沿用应用子路径（例如 /dsa），避免 POST 到根路径
+// 后被 nginx 301 重定向。仅在显式提供 VITE_API_URL 时覆盖默认行为。
+export const API_BASE_URL = configuredApiBaseUrl || (APP_BASE_PATH === '/' ? '' : APP_BASE_PATH);
 
 export type WebBuildInfo = {
   version: string;

@@ -1148,6 +1148,9 @@ class StockAnalysisPipeline:
                 'total_mv': getattr(realtime_quote, 'total_mv', None),
                 'circ_mv': getattr(realtime_quote, 'circ_mv', None),
                 'change_60d': getattr(realtime_quote, 'change_60d', None),
+                # The prompt renders prices with this unit; without it a US or HK
+                # quote falls back to the A-share 元 (RMB) label.
+                'currency': getattr(realtime_quote, 'currency', None),
                 'source': quote_source_name,
                 'fetched_at': getattr(realtime_quote, 'fetched_at', None),
                 'provider_timestamp': getattr(realtime_quote, 'provider_timestamp', None),
