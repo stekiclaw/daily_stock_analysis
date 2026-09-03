@@ -28,11 +28,18 @@ from src.config import (
 from src.llm.backend_registry import (
     LOCAL_CLI_GENERATION_BACKEND_IDS,
     LITELLM_BACKEND_ID,
+    REMOTE_OAUTH_GENERATION_BACKEND_IDS,
     SUPPORTED_GENERATION_BACKENDS,
     normalize_backend_id,
     resolve_generation_backend_id,
     resolve_generation_fallback_backend_id,
 )
+from src.llm.codex_oauth import (
+    DEFAULT_AUTH_FILE as CODEX_OAUTH_DEFAULT_AUTH_FILE,
+    DEFAULT_EFFORT as CODEX_OAUTH_DEFAULT_EFFORT,
+    DEFAULT_MODEL as CODEX_OAUTH_DEFAULT_MODEL,
+)
+from src.llm.codex_oauth_backend import CodexOAuthGenerationBackend
 from src.llm.generation_backend import GenerationCapabilities, GenerationError, GenerationErrorCode
 from src.llm.hermes import (
     HERMES_DEFAULT_BASE_URL,
@@ -456,7 +463,12 @@ class GenerationBackendStatusService:
         if health_status == "not_tested" and cheap_error is not None:
             current_health = "failed"
         capabilities = self._capabilities_for_backend(backend_id)
-        backend_type = "local_cli" if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS else "litellm"
+        if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+            backend_type = "local_cli"
+        elif backend_id in REMOTE_OAUTH_GENERATION_BACKEND_IDS:
+            backend_type = "remote_oauth"
+        else:
+            backend_type = "litellm"
         return {
             "backend_id": backend_id,
             "backend_type": backend_type,
@@ -498,6 +510,9 @@ class GenerationBackendStatusService:
         if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
             preset = resolve_local_cli_preset(backend_id)
             return LocalCliGenerationBackend(config, preset_id=backend_id, preset=preset).get_config_error()
+        if backend_id in REMOTE_OAUTH_GENERATION_BACKEND_IDS:
+            # No API key to inspect: "configured" means a stored OAuth credential.
+            return CodexOAuthGenerationBackend(config).get_config_error()
         if backend_id == LITELLM_BACKEND_ID:
             validation_error = self._validation_issue_error(backend_id)
             if validation_error is not None:
@@ -657,6 +672,8 @@ class GenerationBackendStatusService:
     def _capabilities_for_backend(backend_id: str) -> GenerationCapabilities:
         if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
             return LocalCliGenerationBackend.capabilities
+        if backend_id in REMOTE_OAUTH_GENERATION_BACKEND_IDS:
+            return CodexOAuthGenerationBackend.capabilities
         return GenerationCapabilities(
             supports_json=True,
             supports_tools=True,
@@ -711,6 +728,18 @@ class GenerationBackendStatusService:
                 _LOCAL_CLI_NUMERIC_SPECS[3],
             ),
             opencode_cli_model=(self._effective_map.get("OPENCODE_CLI_MODEL") or "").strip(),
+            codex_oauth_auth_file=(
+                (self._effective_map.get("CODEX_OAUTH_AUTH_FILE") or "").strip()
+                or CODEX_OAUTH_DEFAULT_AUTH_FILE
+            ),
+            codex_oauth_model=(
+                (self._effective_map.get("CODEX_OAUTH_MODEL") or "").strip()
+                or CODEX_OAUTH_DEFAULT_MODEL
+            ),
+            codex_oauth_reasoning_effort=(
+                (self._effective_map.get("CODEX_OAUTH_REASONING_EFFORT") or "").strip()
+                or CODEX_OAUTH_DEFAULT_EFFORT
+            ),
             litellm_model=litellm_model,
             llm_model_list=model_list,
         )
@@ -737,6 +766,12 @@ class GenerationBackendStatusService:
             generation_backend_max_concurrency=config.generation_backend_max_concurrency,
             local_cli_backend_max_concurrency=config.local_cli_backend_max_concurrency,
             opencode_cli_model=config.opencode_cli_model,
+            codex_oauth_auth_file=config.codex_oauth_auth_file,
+            codex_oauth_model=config.codex_oauth_model,
+            codex_oauth_reasoning_effort=config.codex_oauth_reasoning_effort,
+            agent_codex_oauth_model=(
+                self._effective_map.get("AGENT_CODEX_OAUTH_MODEL") or ""
+            ).strip(),
             litellm_model=config.litellm_model,
             litellm_fallback_models=self._split_csv(self._effective_map.get("LITELLM_FALLBACK_MODELS") or ""),
             llm_model_list=config.llm_model_list,

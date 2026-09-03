@@ -21,6 +21,7 @@ from src.services.screening.config import Config as ScreeningRuntimeConfig
 from src.services.screening.models import HardFilterConfig, Pick, ScreeningConfig, Strategy
 from src.services.screening.scorer import compute_screen_scores
 from src.services.screening import snapshot as screening_snapshot
+from src.services.screening import snapshot_us as us_snapshot
 from src.services.screening.strategy import list_strategies, load_all_strategies
 
 
@@ -611,6 +612,51 @@ def test_snapshot_schema_mismatch_counts_toward_source_circuit_breaker(
     assert calls == ["efinance"]
     assert result.attrs["snapshot_source"] == "efinance"
     assert "temporarily disabled" in result.attrs["source_errors"][0]
+
+
+def test_us_snapshot_enrichment_rejects_cross_currency_yfinance_pb() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "code": "TSM",
+                "name": "TSM",
+                "pe_ratio": None,
+                "pb_ratio": None,
+                "industry": "",
+            },
+            {
+                "code": "MSFT",
+                "name": "MSFT",
+                "pe_ratio": None,
+                "pb_ratio": None,
+                "industry": "",
+            },
+        ]
+    )
+    info_by_ticker = {
+        "TSM": {
+            "trailingPE": 30.0,
+            "priceToBook": 85.94,
+            "currency": "USD",
+            "financialCurrency": "TWD",
+        },
+        "MSFT": {
+            "trailingPE": 35.0,
+            "priceToBook": 11.2,
+            "currency": "USD",
+            "financialCurrency": "USD",
+        },
+    }
+
+    with patch(
+        "yfinance.Ticker",
+        side_effect=lambda ticker: SimpleNamespace(info=info_by_ticker[ticker]),
+    ):
+        us_snapshot._enrich_info_fields(frame)
+
+    assert pd.isna(frame.loc[0, "pb_ratio"])
+    assert frame.loc[1, "pb_ratio"] == 11.2
+    assert frame["pe_ratio"].tolist() == [30.0, 35.0]
 
 
 def test_sina_snapshot_uses_timeout_wrapper(monkeypatch) -> None:

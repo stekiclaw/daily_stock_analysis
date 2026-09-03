@@ -32,7 +32,7 @@ AGENT_BACKEND_ERROR_CODES = frozenset(
         "unknown_backend_error",
     }
 )
-AGENT_BACKEND_IDS = frozenset({"auto", "litellm", "codex_app_server"})
+AGENT_BACKEND_IDS = frozenset({"auto", "litellm", "codex_app_server", "codex_oauth"})
 
 
 class AgentBackendConfigError(ValueError):
@@ -93,13 +93,12 @@ class AgentBackend(ABC):
         """Run one Agent turn and return the normalized result."""
 
 
-class LiteLLMAgentBackend(AgentBackend):
-    """Thin wrapper around the existing DSA-owned ``run_agent_loop``."""
+class LoopOwnedAgentBackend(AgentBackend):
+    """Base for backends where DSA owns the loop and only the adapter differs."""
 
-    backend_id = "litellm"
     runtime_owns_loop = False
 
-    def __init__(self, tool_registry: ToolRegistry, llm_adapter: LLMToolAdapter) -> None:
+    def __init__(self, tool_registry: ToolRegistry, llm_adapter: Any) -> None:
         self.tool_registry = tool_registry
         self.llm_adapter = llm_adapter
 
@@ -137,3 +136,18 @@ class LiteLLMAgentBackend(AgentBackend):
             messages=loop_result.messages,
             total_steps=loop_result.total_steps,
         )
+
+
+class LiteLLMAgentBackend(LoopOwnedAgentBackend):
+    """Runs the loop against the LiteLLM router."""
+
+    backend_id = "litellm"
+
+    def __init__(self, tool_registry: ToolRegistry, llm_adapter: LLMToolAdapter) -> None:
+        super().__init__(tool_registry, llm_adapter)
+
+
+class CodexOAuthAgentBackend(LoopOwnedAgentBackend):
+    """Runs the loop against a ChatGPT/Codex subscription over OAuth."""
+
+    backend_id = "codex_oauth"

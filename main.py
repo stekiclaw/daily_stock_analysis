@@ -1725,6 +1725,17 @@ def main() -> int:
                     "name": "agent_event_monitor",
                 })
 
+            from src.services.runtime_scheduler import (
+                build_decision_signal_outcome_background_tasks,
+            )
+
+            background_tasks.extend(
+                build_decision_signal_outcome_background_tasks(
+                    config,
+                    config_provider=_reload_runtime_config,
+                )
+            )
+
             schedule_kwargs = {
                 "task": scheduled_task,
                 "schedule_time": config.schedule_time,

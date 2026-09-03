@@ -53,7 +53,9 @@ from src.llm.hermes import (
 from src.llm.generation_params import apply_litellm_generation_params
 from src.llm.errors import call_litellm_with_param_recovery
 from src.llm.backend_registry import (
+    CODEX_OAUTH_BACKEND_ID,
     LOCAL_CLI_GENERATION_BACKEND_IDS,
+    NON_LITELLM_GENERATION_BACKEND_IDS,
     LITELLM_BACKEND_ID,
     resolve_generation_backend_id,
     resolve_generation_fallback_backend_id,
@@ -298,7 +300,11 @@ class _AllModelsFailedError(Exception):
         self.last_usage = last_usage or {}
 
 
-from src.utils.data_processing import normalize_report_signal_attribution
+from src.utils.data_processing import (
+    display_numeric_with_suffix,
+    display_value_or_na,
+    normalize_report_signal_attribution,
+)
 
 
 def check_content_integrity(
@@ -560,6 +566,60 @@ _STRUCTURAL_RISK_PHRASE_HINTS = (
     "default",
 )
 
+# Trading currency per market. A price rendered as "元" reads as RMB, so a US or
+# HK quote must carry its own unit rather than inherit the A-share default.
+_MARKET_CURRENCY = {
+    "cn": "CNY",
+    "hk": "HKD",
+    "us": "USD",
+    "jp": "JPY",
+    "kr": "KRW",
+    "tw": "TWD",
+}
+
+# Same wording as NotificationService._CURRENCY_SUFFIX so a report and the prompt
+# that produced it never disagree about what "元" means.
+_CURRENCY_UNIT_LABEL = {
+    "CNY": "元",
+    "RMB": "元",
+    "CNH": "元",
+    "HKD": "港元",
+    "USD": "美元",
+    "JPY": "日元",
+    "KRW": "韩元",
+    "TWD": "新台币",
+}
+
+
+def resolve_market_currency(
+    stock_code: Optional[str],
+    explicit_currency: Optional[str] = None,
+) -> str:
+    """Resolve the quote currency, preferring what the data source reported."""
+    explicit = str(explicit_currency or "").strip().upper()
+    if explicit:
+        return explicit
+    return _MARKET_CURRENCY.get(detect_market(stock_code), "CNY")
+
+
+def currency_unit_label(currency: Optional[str]) -> str:
+    """Chinese unit word for a currency code; unknown codes keep the 元 default."""
+    return _CURRENCY_UNIT_LABEL.get(str(currency or "").strip().upper(), "元")
+
+
+def _context_quote_currency(context: Dict[str, Any]) -> str:
+    """Pick the currency for a prompt context: source value first, market second."""
+    if not isinstance(context, dict):
+        return "CNY"
+    realtime = context.get("realtime")
+    explicit = None
+    if isinstance(realtime, dict):
+        explicit = realtime.get("currency")
+    if not explicit:
+        explicit = context.get("currency")
+    return resolve_market_currency(context.get("code"), explicit)
+
+
 _CAPITAL_FLOW_UNAVAILABLE_STATUS = {
     "not_supported",
     "not supported",
@@ -584,32 +644,41 @@ def _is_meaningful_text(value: Any) -> bool:
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
-    """Safely convert to float; return default on failure. Private helper for chip fill."""
-    if v is None:
+    """Safely convert to a finite float; return default on failure."""
+    if v is None or isinstance(v, bool):
         return default
-    if isinstance(v, (int, float)):
-        try:
-            return default if math.isnan(float(v)) else float(v)
-        except (ValueError, TypeError):
-            return default
     try:
-        return float(str(v).strip())
+        numeric = float(v if not isinstance(v, str) else v.strip())
     except (TypeError, ValueError):
         return default
+    return numeric if math.isfinite(numeric) else default
 
 
 def _coerce_chip_metric(v: Any) -> Optional[float]:
-    """Convert chip metrics while preserving the distinction between missing and zero."""
-    if v is None:
+    """Convert finite chip metrics while preserving missing versus zero."""
+    if v is None or isinstance(v, bool):
         return None
     try:
-        numeric = float(v)
+        numeric = float(v if not isinstance(v, str) else v.strip())
     except (TypeError, ValueError):
-        try:
-            numeric = float(str(v).strip())
-        except (TypeError, ValueError):
-            return None
-    return None if math.isnan(numeric) else numeric
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def _format_fraction_percent(value: Any, precision: int = 1) -> str:
+    """Format a finite ratio as a percentage without leaking invalid tokens."""
+    numeric = _coerce_chip_metric(value)
+    if numeric is None:
+        return display_value_or_na(value)
+    return f"{numeric:.{precision}%}"
+
+
+def _format_signed_metric(value: Any, suffix: str, precision: int = 2) -> str:
+    """Format a finite signed metric, preserving explanatory text without a unit."""
+    numeric = _safe_float(value, default=math.nan)
+    if not math.isfinite(numeric):
+        return display_value_or_na(value)
+    return f"{numeric:+.{precision}f}{suffix}"
 
 
 _BULLISH_TREND_HINTS: Tuple[str, ...] = (
@@ -689,7 +758,7 @@ def _normalize_prompt_reason_items(items: Any) -> List[str]:
         return []
     normalized: List[str] = []
     for item in items:
-        text = str(item).strip()
+        text = display_value_or_na(item, "").strip()
         if text:
             normalized.append(text)
     return normalized
@@ -849,21 +918,33 @@ def _derive_chip_health(profit_ratio: float, concentration_90: float, language: 
 
 
 def _build_chip_structure_from_data(chip_data: Any, language: str = "zh") -> Dict[str, Any]:
-    """Build chip_structure dict from ChipDistribution or dict."""
+    """Build a finite-number-safe chip_structure dict from provider data."""
     if hasattr(chip_data, "profit_ratio"):
-        pr = _safe_float(chip_data.profit_ratio)
-        ac = chip_data.avg_cost
-        c90 = _safe_float(chip_data.concentration_90)
+        raw_profit_ratio = chip_data.profit_ratio
+        avg_cost = chip_data.avg_cost
+        raw_concentration_90 = chip_data.concentration_90
     else:
-        d = chip_data if isinstance(chip_data, dict) else {}
-        pr = _safe_float(d.get("profit_ratio"))
-        ac = d.get("avg_cost")
-        c90 = _safe_float(d.get("concentration_90"))
-    chip_health = _derive_chip_health(pr, c90, language=language)
+        payload = chip_data if isinstance(chip_data, dict) else {}
+        raw_profit_ratio = payload.get("profit_ratio")
+        avg_cost = payload.get("avg_cost")
+        raw_concentration_90 = payload.get("concentration_90")
+
+    profit_ratio = _coerce_chip_metric(raw_profit_ratio)
+    concentration_90 = _coerce_chip_metric(raw_concentration_90)
+    finite_avg_cost = _coerce_chip_metric(avg_cost)
+    chip_health = (
+        _derive_chip_health(profit_ratio, concentration_90, language=language)
+        if profit_ratio is not None and concentration_90 is not None
+        else "N/A"
+    )
     return {
-        "profit_ratio": f"{pr:.1%}",
-        "avg_cost": ac if (ac is not None and _safe_float(ac) != 0.0) else "N/A",
-        "concentration": f"{c90:.2%}",
+        "profit_ratio": (
+            f"{profit_ratio:.1%}" if profit_ratio is not None else "N/A"
+        ),
+        "avg_cost": avg_cost if finite_avg_cost not in (None, 0.0) else "N/A",
+        "concentration": (
+            f"{concentration_90:.2%}" if concentration_90 is not None else "N/A"
+        ),
         "chip_health": chip_health,
     }
 
@@ -1050,7 +1131,10 @@ def stabilize_decision_with_structure(
         flow_bias, flow_reason = _capital_flow_bias_with_status(fundamental_context)
         if flow_bias == "unavailable":
             if isinstance(fundamental_context, dict) and "capital_flow" in fundamental_context:
-                if decision_type == "buy" or advice_decision_type == "buy":
+                should_downgrade_buy = (
+                    decision_type == "buy" or advice_decision_type == "buy"
+                ) and not _capital_flow_is_intentionally_unsupported(flow_reason)
+                if should_downgrade_buy:
                     _downgrade_buy_without_capital_flow(
                         result,
                         language,
@@ -1060,6 +1144,9 @@ def stabilize_decision_with_structure(
                         flow_status=flow_reason,
                     )
                 else:
+                    # Provider coverage gaps are not negative evidence. Preserve
+                    # an otherwise valid decision and only disclose that this
+                    # calibration could not be applied.
                     _set_decision_stability_unavailable(
                         result,
                         language,
@@ -1325,6 +1412,11 @@ def _capital_flow_status_for_stability(reason: str, language: str) -> str:
     if "empty_stock_flow" in normalized or "missing" in normalized:
         return "资金流数据缺失" if language == "zh" else "capital flow data unavailable"
     return "资金流数据不可用" if language == "zh" else "capital flow unavailable"
+
+
+def _capital_flow_is_intentionally_unsupported(reason: str) -> bool:
+    normalized = str(reason or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized in {"not_supported", "unsupported"}
 
 
 def _set_decision_stability_unavailable(
@@ -1977,10 +2069,10 @@ class GeminiAnalyzer:
 
         "battle_plan": {
             "sniper_points": {
-                "ideal_buy": "理想买入点：XX元（在MA5附近）",
-                "secondary_buy": "次优买入点：XX元（在MA10附近）",
-                "stop_loss": "止损位：XX元（跌破MA20或X%）",
-                "take_profit": "目标位：XX元（前高/整数关口）"
+                "ideal_buy": "理想买入点：XX{currency_placeholder}（在MA5附近）",
+                "secondary_buy": "次优买入点：XX{currency_placeholder}（在MA10附近）",
+                "stop_loss": "止损位：XX{currency_placeholder}（跌破MA20或X%）",
+                "take_profit": "目标位：XX{currency_placeholder}（前高/整数关口）"
             },
             "position_strategy": {
                 "suggested_position": "建议仓位：X成",
@@ -2165,10 +2257,10 @@ class GeminiAnalyzer:
 
         "battle_plan": {
             "sniper_points": {
-                "ideal_buy": "理想入场位：XX元（满足主要技能触发条件）",
-                "secondary_buy": "次优入场位：XX元（更保守或确认后执行）",
-                "stop_loss": "止损位：XX元（失效条件或X%风险）",
-                "take_profit": "目标位：XX元（按阻力位/风险回报比制定）"
+                "ideal_buy": "理想入场位：XX{currency_placeholder}（满足主要技能触发条件）",
+                "secondary_buy": "次优入场位：XX{currency_placeholder}（更保守或确认后执行）",
+                "stop_loss": "止损位：XX{currency_placeholder}（失效条件或X%风险）",
+                "take_profit": "目标位：XX{currency_placeholder}（按阻力位/风险回报比制定）"
             },
             "position_strategy": {
                 "suggested_position": "建议仓位：X成",
@@ -2313,7 +2405,7 @@ class GeminiAnalyzer:
                 backend_id, _fallback_backend_id = self._resolve_generation_backend_config()
             except GenerationError:
                 backend_id = ""
-            if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+            if backend_id in NON_LITELLM_GENERATION_BACKEND_IDS:
                 logger.info(
                     "Analyzer generation backend: %s configured; LiteLLM API keys are not "
                     "required for stock analysis generation",
@@ -2369,12 +2461,17 @@ class GeminiAnalyzer:
         lang = normalize_report_language(report_language)
         market_role = get_market_role(stock_code, lang)
         market_guidelines = get_market_guidelines(stock_code, lang)
+        # Price examples in the battle plan must name the market's own currency;
+        # a hardcoded 元 tells the model a US target price is quoted in RMB.
+        price_unit = currency_unit_label(resolve_market_currency(stock_code))
         skill_instructions, default_skill_policy, use_legacy_default_prompt = self._get_skill_prompt_sections()
         if use_legacy_default_prompt:
             base_prompt = self.LEGACY_DEFAULT_SYSTEM_PROMPT.replace(
                 "{market_placeholder}", market_role
             ).replace(
                 "{guidelines_placeholder}", market_guidelines
+            ).replace(
+                "{currency_placeholder}", price_unit
             )
         else:
             skills_section = ""
@@ -2388,6 +2485,7 @@ class GeminiAnalyzer:
                 .replace("{guidelines_placeholder}", market_guidelines)
                 .replace("{default_skill_policy_section}", default_skill_policy_section)
                 .replace("{skills_section}", skills_section)
+                .replace("{currency_placeholder}", price_unit)
             )
         if lang == "en":
             return base_prompt + """
@@ -2480,7 +2578,7 @@ class GeminiAnalyzer:
                 backend_id = resolve_generation_backend_id(config)
             except GenerationError:
                 pass
-            if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+            if backend_id in NON_LITELLM_GENERATION_BACKEND_IDS:
                 logger.info(
                     "Analyzer LiteLLM: LITELLM_MODEL not configured; using %s generation backend",
                     backend_id,
@@ -2583,7 +2681,7 @@ class GeminiAnalyzer:
         if backend_error is not None:
             return self._can_use_generation_fallback(backend_error)
         backend_id, _fallback_backend_id = self._resolve_generation_backend_config()
-        if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+        if backend_id in NON_LITELLM_GENERATION_BACKEND_IDS:
             return True
         return self._litellm_runtime_available()
 
@@ -2621,7 +2719,7 @@ class GeminiAnalyzer:
                 mixed_error = self._get_mixed_hermes_route_error(config, model)
                 if mixed_error is not None:
                     return mixed_error
-            if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+            if backend_id in NON_LITELLM_GENERATION_BACKEND_IDS:
                 backend = self._get_generation_backend(backend_id)
                 get_config_error = getattr(backend, "get_config_error", None)
                 if callable(get_config_error):
@@ -3609,6 +3707,9 @@ class GeminiAnalyzer:
         if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
             return backend_id, backend_id
         config = self._get_runtime_config()
+        if backend_id == CODEX_OAUTH_BACKEND_ID:
+            # LITELLM_MODEL names a model this backend never calls.
+            return backend_id, str(getattr(config, "codex_oauth_model", "") or "")
         return backend_id, str(getattr(config, "litellm_model", "") or "")
 
     def generate_text_with_metadata(
@@ -4029,27 +4130,33 @@ class GeminiAnalyzer:
         unknown_text = get_unknown_text(report_language)
         no_data_text = get_no_data_text(report_language)
         quote_section_title, close_price_label = _phase_aware_quote_labels(context)
+        # Prices, market value and turnover are all quoted in the instrument's own
+        # currency; falling back to 元 would label a US or HK quote as RMB.
+        quote_currency = _context_quote_currency(context)
+        price_unit = currency_unit_label(quote_currency)
         hide_regular_session_ohlc = _should_hide_regular_session_ohlc(context)
         realtime_overlay_quote = hide_regular_session_ohlc and _today_has_realtime_overlay(today)
         pct_chg_label = "实时涨跌幅" if realtime_overlay_quote else "涨跌幅"
         volume_label = "实时成交量" if realtime_overlay_quote else "成交量"
         amount_label = "实时成交额" if realtime_overlay_quote else "成交额"
         quote_rows = [
-            f"| {close_price_label} | {today.get('close', 'N/A')} 元 |",
+            f"| {close_price_label} | "
+            f"{display_numeric_with_suffix(today.get('close'), f' {price_unit}')} |",
         ]
         if not hide_regular_session_ohlc:
             quote_rows.extend(
                 [
-                    f"| 开盘价 | {today.get('open', 'N/A')} 元 |",
-                    f"| 最高价 | {today.get('high', 'N/A')} 元 |",
-                    f"| 最低价 | {today.get('low', 'N/A')} 元 |",
+                    f"| 开盘价 | {display_numeric_with_suffix(today.get('open'), f' {price_unit}')} |",
+                    f"| 最高价 | {display_numeric_with_suffix(today.get('high'), f' {price_unit}')} |",
+                    f"| 最低价 | {display_numeric_with_suffix(today.get('low'), f' {price_unit}')} |",
                 ]
             )
         quote_rows.extend(
             [
-                f"| {pct_chg_label} | {today.get('pct_chg', 'N/A')}% |",
+                f"| {pct_chg_label} | "
+                f"{display_numeric_with_suffix(today.get('pct_chg'), '%')} |",
                 f"| {volume_label} | {self._format_volume(today.get('volume'))} |",
-                f"| {amount_label} | {self._format_amount(today.get('amount'))} |",
+                f"| {amount_label} | {self._format_amount(today.get('amount'), quote_currency)} |",
             ]
         )
         quote_rows_text = "\n".join(quote_rows)
@@ -4096,10 +4203,10 @@ class GeminiAnalyzer:
 ### 均线系统（关键判断指标）
 | 均线 | 数值 | 说明 |
 |------|------|------|
-| MA5 | {today.get('ma5', 'N/A')} | 短期趋势线 |
-| MA10 | {today.get('ma10', 'N/A')} | 中短期趋势线 |
-| MA20 | {today.get('ma20', 'N/A')} | 中期趋势线 |
-| 均线形态 | {context.get('ma_status', unknown_text)} | 多头/空头/缠绕 |
+| MA5 | {display_value_or_na(today.get('ma5'))} | 短期趋势线 |
+| MA10 | {display_value_or_na(today.get('ma10'))} | 中短期趋势线 |
+| MA20 | {display_value_or_na(today.get('ma20'))} | 中期趋势线 |
+| 均线形态 | {display_value_or_na(context.get('ma_status'), unknown_text)} | 多头/空头/缠绕 |
 """
         
         # 添加实时行情数据（量比、换手率等）
@@ -4109,14 +4216,14 @@ class GeminiAnalyzer:
 ### 实时行情增强数据
 | 指标 | 数值 | 解读 |
 |------|------|------|
-| 当前价格 | {rt.get('price', 'N/A')} 元 | |
-| **量比** | **{rt.get('volume_ratio', 'N/A')}** | {rt.get('volume_ratio_desc', '')} |
-| **换手率** | **{rt.get('turnover_rate', 'N/A')}%** | |
-| 市盈率(动态) | {rt.get('pe_ratio', 'N/A')} | |
-| 市净率 | {rt.get('pb_ratio', 'N/A')} | |
-| 总市值 | {self._format_amount(rt.get('total_mv'))} | |
-| 流通市值 | {self._format_amount(rt.get('circ_mv'))} | |
-| 60日涨跌幅 | {rt.get('change_60d', 'N/A')}% | 中期表现 |
+| 当前价格 | {display_numeric_with_suffix(rt.get('price'), f' {price_unit}')} | |
+| **量比** | **{display_value_or_na(rt.get('volume_ratio'))}** | {display_value_or_na(rt.get('volume_ratio_desc'), '')} |
+| **换手率** | **{display_numeric_with_suffix(rt.get('turnover_rate'), '%')}** | |
+| 市盈率(动态) | {display_value_or_na(rt.get('pe_ratio'))} | |
+| 市净率 | {display_value_or_na(rt.get('pb_ratio'))} | |
+| 总市值 | {self._format_amount(rt.get('total_mv'), quote_currency)} | |
+| 流通市值 | {self._format_amount(rt.get('circ_mv'), quote_currency)} | |
+| 60日涨跌幅 | {display_numeric_with_suffix(rt.get('change_60d'), '%')} | 中期表现 |
 """
 
         # 添加财报与分红（价值投资口径）
@@ -4144,19 +4251,23 @@ class GeminiAnalyzer:
         if isinstance(financial_report, dict) or isinstance(dividend_metrics, dict):
             financial_report = financial_report if isinstance(financial_report, dict) else {}
             dividend_metrics = dividend_metrics if isinstance(dividend_metrics, dict) else {}
-            ttm_yield = dividend_metrics.get("ttm_dividend_yield_pct", "N/A")
-            ttm_cash = dividend_metrics.get("ttm_cash_dividend_per_share", "N/A")
-            ttm_count = dividend_metrics.get("ttm_event_count", "N/A")
-            report_date = financial_report.get("report_date", "N/A")
+            ttm_yield = display_value_or_na(
+                dividend_metrics.get("ttm_dividend_yield_pct")
+            )
+            ttm_cash = display_value_or_na(
+                dividend_metrics.get("ttm_cash_dividend_per_share")
+            )
+            ttm_count = display_value_or_na(dividend_metrics.get("ttm_event_count"))
+            report_date = display_value_or_na(financial_report.get("report_date"))
             prompt += f"""
 ### 财报与分红（价值投资口径）
 | 指标 | 数值 | 说明 |
 |------|------|------|
 | 最近报告期 | {report_date} | 来自结构化财报字段 |
-| 营业收入 | {financial_report.get('revenue', 'N/A')} | |
-| 归母净利润 | {financial_report.get('net_profit_parent', 'N/A')} | |
-| 经营现金流 | {financial_report.get('operating_cash_flow', 'N/A')} | |
-| ROE | {financial_report.get('roe', 'N/A')} | |
+| 营业收入 | {display_value_or_na(financial_report.get('revenue'))} | |
+| 归母净利润 | {display_value_or_na(financial_report.get('net_profit_parent'))} | |
+| 经营现金流 | {display_value_or_na(financial_report.get('operating_cash_flow'))} | |
+| ROE | {display_value_or_na(financial_report.get('roe'))} | |
 | 近12个月每股现金分红 | {ttm_cash} | 仅现金分红、税前口径 |
 | TTM 股息率 | {ttm_yield} | 公式：近12个月每股现金分红 / 当前价格 × 100% |
 | TTM 分红事件数 | {ttm_count} | |
@@ -4186,7 +4297,10 @@ class GeminiAnalyzer:
         )
         has_capital_flow = (
             isinstance(stock_flow, dict)
-            and any(v is not None for v in stock_flow.values())
+            and any(
+                math.isfinite(_safe_float(stock_flow.get(key), default=math.nan))
+                for key in ("main_net_inflow", "inflow_5d", "inflow_10d")
+            )
         ) or (
             isinstance(sector_flow, dict)
             and (sector_flow.get("top") or sector_flow.get("bottom"))
@@ -4208,9 +4322,9 @@ class GeminiAnalyzer:
 ### 主力资金流向（操作建议过滤器）
 | 指标 | 数值 | 决策含义 |
 |------|------|----------|
-| 主力净流入 | {stock_flow.get('main_net_inflow', 'N/A')} | 正值偏支持，负值偏压制 |
-| 5日净流入 | {stock_flow.get('inflow_5d', 'N/A')} | 用于判断资金持续性 |
-| 10日净流入 | {stock_flow.get('inflow_10d', 'N/A')} | 用于判断资金持续性 |
+| 主力净流入 | {display_value_or_na(stock_flow.get('main_net_inflow'))} | 正值偏支持，负值偏压制 |
+| 5日净流入 | {display_value_or_na(stock_flow.get('inflow_5d'))} | 用于判断资金持续性 |
+| 10日净流入 | {display_value_or_na(stock_flow.get('inflow_10d'))} | 用于判断资金持续性 |
 | 资金流入靠前板块 | {top_sector_text} | 板块资金共振参考 |
 | 资金流出靠前板块 | {bottom_sector_text} | 板块风险参考 |
 
@@ -4234,7 +4348,9 @@ class GeminiAnalyzer:
             and institution_block.get("status") == "ok"
             and isinstance(institution_data, dict)
             and all(
-                institution_data.get(key) is not None
+                math.isfinite(
+                    _safe_float(institution_data.get(key), default=math.nan)
+                )
                 for key in ("foreign_net", "trust_net", "dealer_net", "total_net")
             )
         ):
@@ -4242,28 +4358,27 @@ class GeminiAnalyzer:
 ### 三大法人动向（台股筹码过滤器，净买卖超，单位:股）
 | 法人 | 净买卖超 | 决策含义 |
 |------|------|----------|
-| 外资 | {institution_data.get('foreign_net', 'N/A')} | 正值=净买超偏支持，负值=净卖超偏压制 |
-| 投信 | {institution_data.get('trust_net', 'N/A')} | 投信持续买超常伴随中线做多 |
-| 自营商 | {institution_data.get('dealer_net', 'N/A')} | 短线避险/自营方向参考 |
-| 三大法人合计 | {institution_data.get('total_net', 'N/A')} | 台股最受关注的筹码信号 |
-| 资料日期 | {institution_data.get('date', 'N/A')} | 来源 {institution_data.get('source', 'N/A')} |
+| 外资 | {display_value_or_na(institution_data.get('foreign_net'))} | 正值=净买超偏支持，负值=净卖超偏压制 |
+| 投信 | {display_value_or_na(institution_data.get('trust_net'))} | 投信持续买超常伴随中线做多 |
+| 自营商 | {display_value_or_na(institution_data.get('dealer_net'))} | 短线避险/自营方向参考 |
+| 三大法人合计 | {display_value_or_na(institution_data.get('total_net'))} | 台股最受关注的筹码信号 |
+| 资料日期 | {display_value_or_na(institution_data.get('date'))} | 来源 {display_value_or_na(institution_data.get('source'))} |
 
 > 三大法人是台股的筹码过滤器（相当于 A 股主力资金/龙虎榜的角色，但口径不同、不可混用）：外资与投信同向净买支持价格、同向净卖压制价格。请据此判断台股筹码结构，不要在有本数据时写“筹码结构：数据缺失”。
 """
 
         # 添加筹码分布数据
-        if 'chip' in context:
-            chip = context['chip']
-            profit_ratio = chip.get('profit_ratio', 0)
+        chip = context.get("chip")
+        if isinstance(chip, dict):
             prompt += f"""
 ### 筹码分布数据（效率指标）
 | 指标 | 数值 | 健康标准 |
 |------|------|----------|
-| **获利比例** | **{profit_ratio:.1%}** | 70-90%时警惕 |
-| 平均成本 | {chip.get('avg_cost', 'N/A')} 元 | 现价应高于5-15% |
-| 90%筹码集中度 | {chip.get('concentration_90', 0):.2%} | <15%为集中 |
-| 70%筹码集中度 | {chip.get('concentration_70', 0):.2%} | |
-| 筹码状态 | {chip.get('chip_status', unknown_text)} | |
+| **获利比例** | **{_format_fraction_percent(chip.get('profit_ratio'), 1)}** | 70-90%时警惕 |
+| 平均成本 | {display_numeric_with_suffix(chip.get('avg_cost'), f' {price_unit}')} | 现价应高于5-15% |
+| 90%筹码集中度 | {_format_fraction_percent(chip.get('concentration_90'), 2)} | <15%为集中 |
+| 70%筹码集中度 | {_format_fraction_percent(chip.get('concentration_70'), 2)} | |
+| 筹码状态 | {display_value_or_na(chip.get('chip_status'), unknown_text)} | |
 """
         else:
             chip_unavailable_text = get_chip_unavailable_text(report_language)
@@ -4286,20 +4401,35 @@ class GeminiAnalyzer:
                 volume_change_ratio=context.get('volume_change_ratio'),
             )
             consistency_notes = trend.get('prompt_consistency_notes', [])
+            bias_ma5 = _safe_float(trend.get("bias_ma5"), default=math.nan)
+            trend_strength_text = display_numeric_with_suffix(
+                trend.get("trend_strength"), "/100"
+            )
+            bias_ma5_text = _format_signed_metric(trend.get("bias_ma5"), "%")
+            bias_ma10_text = _format_signed_metric(trend.get("bias_ma10"), "%")
+            signal_score_text = display_numeric_with_suffix(
+                trend.get("signal_score"), "/100"
+            )
             if use_legacy_default_prompt:
-                bias_warning = "🚨 超过5%，严禁追高！" if trend.get('bias_ma5', 0) > 5 else "✅ 安全范围"
+                bias_warning = (
+                    "🚨 超过5%，严禁追高！"
+                    if math.isfinite(bias_ma5) and bias_ma5 > 5
+                    else "✅ 安全范围"
+                    if math.isfinite(bias_ma5)
+                    else no_data_text
+                )
                 prompt += f"""
 ### 趋势分析预判（基于交易理念）
 | 指标 | 数值 | 判定 |
 |------|------|------|
-| 趋势状态 | {trend.get('trend_status', unknown_text)} | |
-| 均线排列 | {trend.get('ma_alignment', unknown_text)} | MA5>MA10>MA20为多头 |
-| 趋势强度 | {trend.get('trend_strength', 0)}/100 | |
-| **乖离率(MA5)** | **{trend.get('bias_ma5', 0):+.2f}%** | {bias_warning} |
-| 乖离率(MA10) | {trend.get('bias_ma10', 0):+.2f}% | |
-| 量能状态 | {trend.get('volume_status', unknown_text)} | {trend.get('volume_trend', '')} |
-| 系统信号 | {trend.get('buy_signal', unknown_text)} | |
-| 系统评分 | {trend.get('signal_score', 0)}/100 | |
+| 趋势状态 | {display_value_or_na(trend.get('trend_status'), unknown_text)} | |
+| 均线排列 | {display_value_or_na(trend.get('ma_alignment'), unknown_text)} | MA5>MA10>MA20为多头 |
+| 趋势强度 | {trend_strength_text} | |
+| **乖离率(MA5)** | **{bias_ma5_text}** | {bias_warning} |
+| 乖离率(MA10) | {bias_ma10_text} | |
+| 量能状态 | {display_value_or_na(trend.get('volume_status'), unknown_text)} | {display_value_or_na(trend.get('volume_trend'), '')} |
+| 系统信号 | {display_value_or_na(trend.get('buy_signal'), unknown_text)} | |
+| 系统评分 | {signal_score_text} | |
 
 #### 系统分析理由
 **买入理由**：
@@ -4317,21 +4447,23 @@ class GeminiAnalyzer:
             else:
                 bias_warning = (
                     "🚨 偏离较大，需谨慎评估追高风险"
-                    if trend.get('bias_ma5', 0) > 5
+                    if math.isfinite(bias_ma5) and bias_ma5 > 5
                     else "✅ 位置相对可控"
+                    if math.isfinite(bias_ma5)
+                    else no_data_text
                 )
                 prompt += f"""
 ### 技术与结构分析（供激活技能判断参考）
 | 指标 | 数值 | 说明 |
 |------|------|------|
-| 趋势状态 | {trend.get('trend_status', unknown_text)} | |
-| 均线排列 | {trend.get('ma_alignment', unknown_text)} | 结合激活技能判断结构强弱 |
-| 趋势强度 | {trend.get('trend_strength', 0)}/100 | |
-| **价格位置(MA5)** | **{trend.get('bias_ma5', 0):+.2f}%** | {bias_warning} |
-| 价格位置(MA10) | {trend.get('bias_ma10', 0):+.2f}% | |
-| 量能状态 | {trend.get('volume_status', unknown_text)} | {trend.get('volume_trend', '')} |
-| 系统信号 | {trend.get('buy_signal', unknown_text)} | |
-| 系统评分 | {trend.get('signal_score', 0)}/100 | |
+| 趋势状态 | {display_value_or_na(trend.get('trend_status'), unknown_text)} | |
+| 均线排列 | {display_value_or_na(trend.get('ma_alignment'), unknown_text)} | 结合激活技能判断结构强弱 |
+| 趋势强度 | {trend_strength_text} | |
+| **价格位置(MA5)** | **{bias_ma5_text}** | {bias_warning} |
+| 价格位置(MA10) | {bias_ma10_text} | |
+| 量能状态 | {display_value_or_na(trend.get('volume_status'), unknown_text)} | {display_value_or_na(trend.get('volume_trend'), '')} |
+| 系统信号 | {display_value_or_na(trend.get('buy_signal'), unknown_text)} | |
+| 系统评分 | {signal_score_text} | |
 
 #### 系统分析理由
 **支持因素**：
@@ -4349,11 +4481,11 @@ class GeminiAnalyzer:
         
         # 添加昨日对比数据
         if 'yesterday' in context:
-            volume_change = context.get('volume_change_ratio', 'N/A')
+            volume_change = context.get('volume_change_ratio')
             prompt += f"""
 ### 量价变化
-- 成交量较昨日变化：{volume_change}倍
-- 价格较昨日变化：{context.get('price_change_ratio', 'N/A')}%
+- 成交量较昨日变化：{display_numeric_with_suffix(volume_change, '倍')}
+- 价格较昨日变化：{display_numeric_with_suffix(context.get('price_change_ratio'), '%')}
 """
             parsed_volume_change = _safe_float(volume_change, default=math.nan)
             if math.isfinite(parsed_volume_change) and parsed_volume_change > 10:
@@ -4503,43 +4635,56 @@ class GeminiAnalyzer:
     
     def _format_volume(self, volume: Optional[float]) -> str:
         """格式化成交量显示"""
-        if volume is None:
+        if volume is None or isinstance(volume, bool):
             return 'N/A'
-        if volume >= 1e8:
-            return f"{volume / 1e8:.2f} 亿股"
-        elif volume >= 1e4:
-            return f"{volume / 1e4:.2f} 万股"
-        else:
-            return f"{volume:.0f} 股"
-    
-    def _format_amount(self, amount: Optional[float]) -> str:
-        """格式化成交额显示"""
-        if amount is None:
+        try:
+            numeric_volume = float(volume)
+        except (TypeError, ValueError):
             return 'N/A'
-        if amount >= 1e8:
-            return f"{amount / 1e8:.2f} 亿元"
-        elif amount >= 1e4:
-            return f"{amount / 1e4:.2f} 万元"
-        else:
-            return f"{amount:.0f} 元"
+        if not math.isfinite(numeric_volume):
+            return 'N/A'
+        if numeric_volume >= 1e8:
+            return f"{numeric_volume / 1e8:.2f} 亿股"
+        if numeric_volume >= 1e4:
+            return f"{numeric_volume / 1e4:.2f} 万股"
+        return f"{numeric_volume:.0f} 股"
+
+    def _format_amount(self, amount: Optional[float], currency: Optional[str] = None) -> str:
+        """格式化成交额显示（按标的实际计价币种标注单位）"""
+        if amount is None or isinstance(amount, bool):
+            return 'N/A'
+        try:
+            numeric_amount = float(amount)
+        except (TypeError, ValueError):
+            return 'N/A'
+        if not math.isfinite(numeric_amount):
+            return 'N/A'
+        unit = currency_unit_label(currency)
+        if numeric_amount >= 1e8:
+            return f"{numeric_amount / 1e8:.2f} 亿{unit}"
+        if numeric_amount >= 1e4:
+            return f"{numeric_amount / 1e4:.2f} 万{unit}"
+        return f"{numeric_amount:.0f} {unit}"
 
     def _format_percent(self, value: Optional[float]) -> str:
         """格式化百分比显示"""
-        if value is None:
+        if value is None or isinstance(value, bool):
             return 'N/A'
         try:
-            return f"{float(value):.2f}%"
+            numeric_value = float(value)
         except (TypeError, ValueError):
             return 'N/A'
+        return f"{numeric_value:.2f}%" if math.isfinite(numeric_value) else 'N/A'
 
     def _format_price(self, value: Optional[float]) -> str:
         """格式化价格显示"""
-        if value is None:
+        if value is None or isinstance(value, bool):
             return 'N/A'
         try:
-            return f"{float(value):.2f}"
+            numeric_value = float(value)
         except (TypeError, ValueError):
             return 'N/A'
+        return f"{numeric_value:.2f}" if math.isfinite(numeric_value) else 'N/A'
 
     def _build_market_snapshot(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """构建当日行情快照（展示用）"""
@@ -4576,15 +4721,17 @@ class GeminiAnalyzer:
             "change_amount": self._format_price(change_amount),
             "amplitude": self._format_percent(amplitude),
             "volume": self._format_volume(today.get('volume')),
-            "amount": self._format_amount(today.get('amount')),
+            "amount": self._format_amount(today.get('amount'), _context_quote_currency(context)),
         }
 
         if realtime:
             snapshot.update({
                 "price": self._format_price(realtime.get('price')),
-                "volume_ratio": realtime.get('volume_ratio', 'N/A'),
+                "volume_ratio": display_value_or_na(realtime.get('volume_ratio')),
                 "turnover_rate": self._format_percent(realtime.get('turnover_rate')),
-                "source": getattr(realtime.get('source'), 'value', realtime.get('source', 'N/A')),
+                "source": display_value_or_na(
+                    getattr(realtime.get('source'), 'value', realtime.get('source'))
+                ),
             })
 
         return snapshot

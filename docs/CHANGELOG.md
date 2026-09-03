@@ -8,7 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 非交易日不再用实时报价的涨跌幅覆盖官方日线：收盘后 provider 返回的实时快照会用自带的 `pre_close` 反推 `change_pct`，该 `pre_close` 可能落后一个交易日（实测 MSFT 2026-08-28 报 `+2.08%`，官方日线前收 505.06 应为 `+1.68%`），导致报告表头 / 历史列表卡片与正文给出两个涨跌幅。现在 `is_trading_day` 明确为 False 时改用官方日线的 `close` / `pct_chg`；官方字段只有在可解析为有限数字时才逐字段覆盖，NaN / Infinity 不会抹掉有效实时报价，`0` 仍保留。盘中与盘后（仍是交易日）以及 phase 未知时保持原有实时报价优先语义，但无效实时报价会降级为空值而不是继续进入结果与 DecisionSignal。
+- [修复] 上述护栏同时覆盖非 Agent 分析路径、Agent 分析路径与历史记录读取路径（`extract_realtime_detail_fields`），避免同一语义只修一个入口；Agent 历史快照现在会真实持久化分析上下文中的 `date` / 官方 `today` / `yesterday`，确保进程重启后的 API meta、历史列表与 DecisionSignal 仍可使用同一官方日线。读取侧可直接校正已含官方日线的旧快照；旧 Agent 快照若从未保存该日线，仍需按确认范围回填。
+- [修复] 报告数值边界不再把决策仪表盘的显式 null 或非有限数字渲染成字面量 `None` / `NaN` / `Infinity`：`dict.get(key, 'N/A')` 与 Jinja 的 `get(key, 'N/A')` 只在 key 缺失时生效，部分美股或 ETF 因股本字段缺失无法计算换手率，部分数据源也可能缺少量比。现统一将无效值渲染为 `N/A`，且仅对有限数值或数字字符串添加 `%` / `/100` / `倍` / 货币单位，不再出现 `N/A%`、`N/A/100` 或「数据缺失，无法判断%」；`0` 等合法数值不受影响。覆盖当前分析 Prompt 的行情、昨日对比、筹码、趋势、财报、资金流和法人输入，以及 Notification / History / Jinja 的核心结论、时效性、持仓建议、仓位策略、行情快照、数据透视、筹码、狙击点、多策略冲突数/置信度、策略技能/信号/冲突参与者与结构化财务展示；Web/API 的行情与狙击点读取入口同步拒绝非有限值。
+- [修复] API/history 的结构化基本面提取现在递归规范化财报、分红及其嵌套列表：NumPy 标量/数组转换为原生 JSON 类型，NaN / Infinity 及其精确字符串占位转为 `null` 或在合并时视为缺失，且不会覆盖更早的有限 fallback 值；完整 payload 可用 `allow_nan=False` 严格序列化。大盘复盘通用数值 formatter 同时不再把合法 `0` 当作 `N/A`，Jinja 历史比较也保留 `sentiment_score=0`。
+- [修复] YFinance 实时行情与美股筛选快照不再直接采用跨币种上市标的的原始 `priceToBook`：当 `currency` 与 `financialCurrency` 均明确且不一致时（如 TSM 的 USD ADR 报价与 TWD 财务口径），P/B 降级为缺失并写入 `missing_fields`，避免把不同币种和 ADR 份额口径混算；同币种或财务币种未知时保留 provider 原值，不使用任意阈值过滤高 P/B。
+- [修复] 大盘复盘对 provider 返回的 NaN / Infinity 增加有限数字护栏：指数表格与 LLM 输入统一显示 `N/A`，指数及板块/概念排名等嵌套结构化 payload 将非有限数字保存为 JSON `null`，并把 NumPy 数值、布尔值及数组标量转换为标准 JSON 类型；Market Light 仅使用有效的权益指数涨跌幅并排除 VIX 等反向语义的波动率指标，核心指数不可用时不再因 NaN 比较得到错误的绿色 risk-on 分数。市场复盘 context-pack 质量现按核心指数方向证据推导：核心方向不可用时标为 `partial/usable`，美股仅因结构上不支持 breadth / limit 而产生的 Market Light `partial` 不会误降级，未生成 Market Light 的市场则回看实际指数 payload；Notification、History、Jinja 与 API 行情读取入口也会拒绝 `None`、NaN、Infinity 和孤立单位。
+- [修复] 美股实时行情保留真实 provider 身份：YFinance / Finnhub / Alpha Vantage 不再把自身写成通用 `fallback`，只有首个成功前发生真实 provider 失败时才通过 `fallback_from` 标记降级；AnalysisContextPack 因此不再把首个成功的 YFinance 主行情误记为 `fallback/65`。运行流程同步按每个 data type 区分主来源、首个成功前的真实 fallback、首个成功后的 supplement/enrichment 和未配置/不适用的 skipped 节点，补充源及 `unavailable` 不再增加 `fallback_count` / `failed_attempts`，结构性 `not_supported` 也不再把整次执行误标为降级。
+- [修复] Agent 分析链路现在先判定美股/港股/ETF/指数的筹码能力边界，结构性不支持时不再调用 A 股专属 Akshare 接口，并把 `chip_not_supported` 传入 Agent 的最终 AnalysisContextPack。Agent 搜索工具实际返回的标题、摘要、来源、日期和脱敏 URL 会随本次报告持久化到 `news_content` / `context_snapshot`，工具执行后重新构建公开 context-pack；`news_result_count`、`news_evidence_present` 与 `search_performed` 均来自模型真正消费的工具证据，不再用分析结束后的第二次补查代替。
+- [修复] `search_stock_news()` 按 provider 能力向 Finnhub、Yahoo 与 ETF 成分股新闻源统一传递 `stock_code`，解决 Agent 入口把 MSFT 传成 `None` 导致 Finnhub 永远失败的问题；不适用的 symbol-scoped 来源改记为 `not_applicable/skipped`。Finnhub 原始 JSON 中已验证的 UTF-8 标点 mojibake（如 `10â12%`、`â`、`â`）按显式白名单修复，不对任意 Unicode 文本做不受控重编码。
+- [修复] 大盘复盘现在按标题与来源（必要时回退到规范化 URL 或摘要）跨多个检索 query 去重，结构化 payload、模型输入与最终新闻条数保持一致；报告日期优先采用权益指数 provider 的实际交易日并排除 VIX 对日期的干扰，Yahoo 未提供可靠指数成交额时保留 `null`、报告展示 `N/A`，不再用生成日或 `0.0` 冒充真实市场数据。
+- [修复] 运行诊断现同时汇总完整 AnalysisContextPack 质量与新闻 provider chain：`partial/fallback/stale/estimated/missing/fetch_failed` 输入块会让 diagnostics 与 flow 一致标为降级，结构性 `not_supported` 只展示能力边界；多个独立新闻检索链分别统计真实 fallback，skipped 和首个成功后的 supplement 不计失败。DecisionSignal 也不再把 `decision_stability.applied=False` 的说明误记为已应用 guardrail，模型自身的 action、分数与 legacy 建议冲突仍作为证据保留而不擅自改写。
+- [改进] 多维度情报搜索的搜索源链路改为按目标条数推进：单个搜索源返回的结果不足目标条数（每维度 3 条）时继续向下一个搜索源补充，并按 URL 归一化去重后合并；达到目标即停止，不会遍历全部搜索源。合并结果的来源标记为参与贡献的搜索源组合（如 `FinnhubNews+ETFConstituentNews`）
 - [修复] 美股日线路由现按各数据源当前优先级排序，单项 `*_PRIORITY` 配置（如 `YFINANCE_PRIORITY=0`）对美股即时生效；指数固定首选与 Longbridge preferred 语义保持不变
+
+- [修复] 非交易日明确 `is_trading_day=false` 时，普通与 Agent 分析、历史 API meta 和 DecisionSignal 统一使用官方日线 `close/pct_chg`；官方字段仅在有限数值时逐字段覆盖，phase 未知或 estimated bar 保持实时值，Agent 快照同步持久化实际 `date/today/yesterday`。
+- [修复] 报告与 Prompt 的数值边界统一拒绝 `None`、NaN、Infinity 和孤立单位，覆盖行情、趋势、筹码、财务、资金流、核心结论、持仓/仓位、多策略技能与冲突字段；合法 `0`、`False` 和 conflict severity `none` 保留真实语义。
+- [修复] API/history 的结构化财报和分红递归转换 NumPy 标量/数组并支持 strict JSON；全非有限 overlay（含 ndarray/list/tuple）不再抹掉已有有限 fallback，含真实有限值或 0 的 overlay 仍正常清洗后采用。
+- [修复] 大盘复盘过滤指数与板块 payload 中的非有限值；VIX 不再被当作权益方向，核心权益指数不可用时 Market Light 为 yellow/50/unavailable，context quality 为 usable/75，US breadth/limit 结构性不支持不误降核心方向质量。
+- [修复] YFinance 实时行情和美股筛选在报价币种与财务币种均明确且不一致时不采用原始 `priceToBook`，避免 ADR 跨币种混算；币种未知或一致时保留 provider 原值。
+- [修复] 美股实时行情保留真实 provider 身份：YFinance / Finnhub / Alpha Vantage 不再自称通用 fallback；运行流程按 data type 区分 primary、真实 fallback、supplement 与 skipped，补充源和结构性不适用不再污染降级计数。
+- [修复] Agent 在调用 A 股专属筹码接口前先判定美股/港股/ETF/指数能力边界；工具实际消费的新闻标题、摘要、来源、日期和脱敏 URL 会进入最终 context-pack、`news_content` 与历史快照，不再以分析后的第二次补查冒充模型输入。
+- [修复] Finnhub、Yahoo 与 ETF 成分股等 symbol-scoped 新闻源统一收到 `stock_code`，不适用来源记为 `not_applicable/skipped`；Finnhub 上游已确认的 UTF-8 标点 mojibake 按显式白名单修复。
 
 - [新功能] 支持通过 `main.py --stocks` 一次性分析已登记板块指数，自动使用指数适用的数据与分析能力，并保持报告、历史和决策信号兼容。
 - [修复] `main.py --stocks` 在解析股票列表前先 best-effort 刷新股票索引注册表，保证首次运行能吃到刷新后的指数 alias/身份；刷新失败、超时或禁用不阻断分析。
@@ -22,6 +43,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 同步 ResearchArtifact 与 `AnalysisReport.structured_report` 到静态 OpenAPI，避免公开 API 规格与运行时契约漂移。
 - [修复] Linux/Docker 分享图补齐 Noto CJK 字体与中韩文字体栈，避免 PNG 只显示数字和英文、中文或韩文内容消失。
 - [新功能] Web Chat 意图识别层新增分词模块：`web_intent_tokenizer` 六步管道（多股票全名实体扫描 → 标点/空白切分 → 代码形提取 → 市场关键词 → 无歧义关键词 → 残存 gap 多策略 DFS 匹配）把用户消息切分为携带语义标签的 Token 序列；配套 `web_intent_types` 数据字典（Token 结构、Market 枚举、21 个语义 tag、clean/extend 双词池与正则机器）。核心原则"宁可不做，不可做错"：Step 1~5 只做精确匹配，Step 6 要求整段 TAG 全覆盖（交叉验证）才产出，未覆盖片段保持空 tag 交下游 LLM 兜底；代码形 token 辨认为 `stock_code`（附 code/name/market 三元组）/ `wrong_{market}_code` / `unknown_{market}_code` 三态，token 层代码拼写统一 canonical 归一（a=6 位裸数字、hk=HK+5 位、us=大写 ticker）。意图枚举与意图识别结果随后续 `web_intent_resolver` PR 引入。新增 183 个分词单元测试。
+- [新功能] Web 设置页支持 OpenAI-OAuth：「AI 模型接入」新增授权卡片，可在页面上完成设备码授权（显示验证链接与设备码、自动轮询、展示已授权账号与凭证有效期），「快速添加渠道」的服务商下拉新增 OpenAI-OAuth 入口；新增 `CODEX_OAUTH_MODEL` / `CODEX_OAUTH_REASONING_EFFORT` / `CODEX_OAUTH_AUTH_FILE` 配置项。配套新增 `/api/v1/system/config/codex-oauth/status|login` 接口，浏览器全程不接触 token。
+- [新功能] 新增 `codex_oauth` 生成后端：用 ChatGPT/Codex 订阅的 OAuth 设备码授权直连 ChatGPT Responses 接口，不需要本机 CLI，也不消耗按量计费的 `OPENAI_API_KEY`；支持显式选择 gpt-5.6 系列模型与推理档位，并上报真实 token 用量。配置 `GENERATION_BACKEND=codex_oauth` 启用，授权入口为 `python scripts/codex_oauth_login.py`。作为生成后端时覆盖普通分析与大盘复盘。
+- [新功能] 新增 `--portfolio futu`，只读导入 Futu OpenD 真实账户的沪深 A 股、港股、美股 LONG 正股持仓作为分析列表。
+- [修复] 主力资金流「该市场本就不提供」(`not_supported`) 不再被当作看空证据下调买入结论：仅记录未做资金流校准；数据源支持但取数为空/`N/A` 时保持原有保守降级。
+- [修复] 分析提示词按标的实际计价币种标注价格单位（美元/港元/日元/韩元/新台币/元），优先采用行情源返回的 `currency`，其次按市场推断；狙击点位示例同步跟随，避免把美股价格写成人民币「元」。
+- [修复] Codex OAuth 凭证刷新加进程内 + 跨进程文件锁并在加锁后重读凭证，避免多 worker 同时用同一 refresh_token 轮换导致互相失效；凭证改为同目录唯一临时文件原子写入（0600），不再 chmod 已存在的父目录。
+- [修复] Codex OAuth 设备码登录取消后立即结束轮询，不再继续请求上游直到超时。
+- [修复] Codex OAuth 生成后端按 `GENERATION_BACKEND_MAX_CONCURRENCY` 全进程限流，此前每个后端实例各自计数，等于没有并发上限。
+- [修复] Agent 工具循环回放 Responses `function_call` 时同时带上原始 output-item `id`（保存在 `provider_specific_fields`），修复多轮工具调用被上游拒绝。
+- [修复] 前端补回缺失的 `utils/clipboard`，复制统一走 Clipboard API + `execCommand` 回退，HTTP 局域网部署下复制不再静默失败；仅在复制成功后显示「已复制」。
+- [修复] `/dsa/` 子路径部署：Docker 构建透传 `VITE_BASE_PATH`，Vite `base`、路由 `basename`、API baseURL、登录跳转与 `stocks.index.json` 均按部署前缀解析。
+- [文档] 移除 Unreleased 中 ETF 种子数据、`get_leveraged_etf_metadata`、`get_stock_extended_profile`、`get_option_expirations` / `get_option_chain`、`get_etf_profile` 等仓库中并不存在的条目。
+- [新功能] schedule 模式新增可选的决策信号后验维护任务，按有界批次自动补齐缺失 outcome 并重试行情数据可恢复的 unable，不调用 LLM。
+- [修复] 多维情报搜索在首选开放式搜索渠道配额耗尽、异常或过滤后无结果时继续尝试其他同能力渠道，同时保持 Yahoo Finance 只服务标的新闻维度。
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [新功能] 完善 Futu OpenD 港股数据源接入：系统设置支持 OpenD 地址、端口和港股实时数据源优先级，保留 Longbridge、AkShare、YFinance fallback。
@@ -39,6 +74,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 阻止任意更新的非 bundled 指数候选（含 legacy `static` 子集）在 remote 缺失/损坏时以 active-index 子集覆盖 bundled baseline：所有非 bundled 候选必须为 bundled active-index canonical 集合的合法超集，否则回退 bundled 并记录 WARNING。
 - [新功能] 桌面端全局右上角增加更新入口，与设置页共用更新状态；普通浏览器 WebUI 不展示，且不会在挂载时重复触发后台检查。
 - [修复] 桌面端右上角更新入口与设置页共用检查中状态，避免一侧检查时另一侧仍可重复触发 GitHub Releases 检查；主进程手动检查路径同步增加 in-flight 防重。
+- [修复] `YfinanceFetcher` 不再把量比/换手率硬编码为空：复用同一次请求已拉取的 `ticker.info`（无额外请求）换算量比（优先 10 日均量，退回约 3 个月均量近似 A 股 5 日口径）与换手率（优先流通股本），此前美股/日股/韩股/台股报告的这两个字段永远是 N/A，模型无法据此判断放量/缩量。
+- [修复] 筹码分布：区分"该市场/品种结构性不支持"（美股/港股/ETF/指数）与"抓取失败"——新增 `DataFetcherManager.is_chip_distribution_unsupported_market`，pipeline 据此把前者标记为 `chip_not_supported` 元数据；`AnalysisContextBuilder` 已有的 NOT_SUPPORTED 判定分支此前从未被写入过，所有非 A 股报告的筹码数据质量分因此被误判为抓取失败（35/100）而非结构性不适用（70/100）。
+
+- [新功能] 新增 `FinnhubNews` 美股公司新闻源（`/company-news`，Finnhub 免费层可用，复用既有 `FINNHUB_API_KEY`），排在 Yahoo 兜底源之前。计费搜索源额度耗尽、自建 SearXNG 上游引擎被 CAPTCHA 拦截时，美股分析曾只剩 0-1 条新闻；该源按标的返回量高一个数量级。结果按"是否确为该标的"优先、再按时间排序——该接口约三成返回是同日通用行情通稿，纯按时间截断会把 `max_results` 预算耗在噪音上（实测前 5 条相关数 3/5 → 5/5）。
+- [修复] `YfinanceFetcher` 实时行情补齐成交额（`amount`）：此前恒为 `None`，导致"今日成交额"显示 N/A，而历史每一行都有值、无法与当日对比。改用与日线列相同的口径（`volume * price`，见 `_estimate_yfinance_amount`），两者可比；同时该字段不再计入 `missing_fields`，行情数据质量从 `partial` 回到 `ok`。
+- [改进] `FinnhubFetcher.priority` 支持 `FINNHUB_PRIORITY` 环境变量（默认 2，行为不变）。Finnhub 免费层不含 `/stock/candle`，日线恒 403 并反复触发熔断；免费层部署可设 `FINNHUB_PRIORITY=9` 将其排至美股日线链路末尾，付费层不受影响，且不影响新增的 Finnhub 新闻源。
+
+- [新功能] 新增 ETF 成分股新闻兜底源 `ETFConstituentNews`（无需 API Key，`ETF_CONSTITUENT_NEWS_ENABLED=true` 启用，默认关闭）。冷门与杠杆/反向 ETF 常年不产生自己的新闻——SOXS 在 Yahoo 上最新一条是 29 天前，对 3 天分析窗口而言基金层来源全部（正确地）返回空，报告因此没有任何舆情面。ETF 价格由成分股驱动，故回退到取前五大持仓的新闻；结果标注来源成分股，不会被误读为基金公告。仅在基金层来源（Finnhub/Yahoo）全空时触发，真实基金新闻始终优先；现金/货币基金类持仓会被过滤，因此仅持有掉期抵押品的杠杆/反向基金仍解析不出成分股。结果同样按"是否确为该成分股"优先排序——持仓的新闻流里同样混有同日通用行情稿。
+- [修复] 非交易日（`market_phase_context.is_trading_day=false`）不再用实时报价覆盖 `today` 日线：休市时实时报价只是上一交易日的收盘快照，覆盖会把完整官方日线换成缺 `amount`、日期标成非交易日的估算 bar，并让 `analysis_context_pack_overview` 的 `technical` 数据块恒为 `partial`（75 分）+ `intraday_realtime_overlay` 告警，同时让 Prompt 的「上一完整交易日行情」分支永不生效。护栏与 `_augment_historical_with_realtime` 已有的交易日判断保持一致；阶段未知时保持失败开放，盘前/盘后等交易日内场景行为不变。
+- [修复] `ETFConstituentNews` 的现金类持仓过滤改为按单词边界匹配，并补齐 T-Bill / 货币基金命名变体。原先的子串匹配会把真实成分股当成现金持仓丢掉——`CASH` 命中 FirstCash Holdings（IWO 持仓）、`DEPOSIT` 命中 Light & Wonder 的 “Chess Depository Interest”（BETZ 持仓），也会命中任何写全称的 “American Depositary Receipt”；误杀会静默抹掉该成分股的新闻，代价高于漏判。同时新增 `T-BILL`、`MONEY MKT`/`MMKT`、`GOVERNMENT MONEY`/`GOVT MONEY`：XDTE/QDTE/RDTE 只持有 `WEEK`（Roundhill Weekly T-Bill ETF，占比 5%-7%）和一只政府货币基金，`WEEK` 是四字母代码、名称也不含原有关键词，此前会被当作成分股去抓新闻，并把 T-Bill ETF 新闻流里的通用行情稿标注成该基金的成分股驱动新闻；现在这类基金正确地解析不出成分股。改动已对 338 只基金的 1052 条真实持仓，以及 MoneyLion / MoneyHero / BILL Holdings / Northern Trust / Texas Instruments / Easterly Government Properties 等实体名称验证无误伤。
+- [修复] 运行诊断不再把“补充字段”的数据源尝试当成行情降级：`_provider_component` 现在只把**首个成功之前**的真实失败视为 fallback，并按首个成功的数据源归因。主源成功后 `DataFetcherManager._supplement_quote` 仍会调用 Finnhub/AlphaVantage 等补齐 pe_ratio 等缺失字段，这些尝试与其失败此前会让每次美股分析都显示“实时行情降级”，且来源被错报成最后一个补充源；真正的 fallback（首个成功之前有数据源失败）仍报告 `degraded`，并在 `details.failed_providers` 中列出失败源。
+- [修复] `error_type=unavailable`（数据源未配置或请求时不可用）不再计入数据源失败：未配置长桥/富途/Tushare 的部署不应被永久标记为降级；这类被跳过的数据源改为记入 `details.skipped_providers`，全部数据源都不可用时仍报告 `failed`。
+- [修复] 断点续传命中本地存储时补记一条 `daily_data` provider run（`provider=LocalStorage`、`cache_hit=true`、附 `data_date`），运行诊断由“日线数据未记录诊断信息（unknown）”改为“日线数据来自本地存储缓存（数据日期 …），本次未请求外部数据源（ok）”；`ProviderRun` 新增可选字段 `data_date`，旧诊断记录缺失该字段时保持兼容。
+- [测试] 以 MSFT（补充源成功/失败）与 NBIS（真实 fallback）两条真实历史记录的 provider run 形态，补充运行诊断降级判定与本地缓存日线诊断的回归覆盖。
+
 
 ## [3.31.0] - 2026-08-23
 
@@ -218,6 +268,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] `.env.example` 与 `.github/workflows/00-daily-analysis.yml` 同步映射 `TUSHARE_HTTP_URL`，避免出现"配置项有但 workflow 漏映射"的半修状态
 - [修复] #2051 PR Review 的特权 `pull_request_target` 流程不再检出 fork PR head：敏感文件、标签、报告与 AI 审查统一通过 GitHub API 将 PR 元数据和 diff 作为数据读取，只执行主分支可信脚本；Python 语法、Flake8、确定性检查和离线测试继续由无 secrets 的 `pull_request` CI / `backend-gate` 执行，兼容 `actions/checkout` 新增的 fork checkout 安全保护。
 - [修复] 修复 Windows 上 mimetypes 冷启动时读取注册表导致的进程卡死
+- [修复] 大盘复盘的运行诊断把 LLM 调用固定记成 `provider=litellm` 与 `LITELLM_MODEL`，在非 LiteLLM 生成后端（本地 CLI / OpenAI-OAuth）或触发 fallback 时标注错误。`generate_text()` / `_call_litellm()` 新增可选 `call_metadata`，回传**实际服务该次调用的后端与模型**，诊断改用真实值；调用发生前与失败时回退到当前配置的后端标识。
+- [修复] `codex_oauth` 生成后端此前被若干仅判断本地 CLI 后端的分支漏掉，导致：配置预检不校验 OAuth 凭证、未配置任何 LiteLLM 渠道时 `has_configured_llm_runtime()` 误判为不可用而拦截大盘复盘、启动日志误报未配置 LLM、`[LLM配置]` 日志标注成 LiteLLM 模型名。改为统一按「非 LiteLLM 生成后端」判断。
+- [改进] 设置页保存后新增提示：当某项配置同时由启动期进程环境变量注入（Docker `env_file` / `environment`、shell export）时，本次保存虽对当前进程立即生效，但进程重启会被环境变量重新覆盖而悄悄回滚；提示会列出受影响的配置项并说明需同步修改注入来源。
+- [新功能] 问股 Chat 支持 `AGENT_BACKEND=codex_oauth`：用同一份 ChatGPT/Codex OAuth 凭证直接跑工具调用，不再需要 LiteLLM 渠道或按量计费的 `OPENAI_API_KEY`。DSA 仍拥有 Agent 循环（工具执行、并行调用、超时、进度与取消行为不变），新增的适配层只负责消息与工具声明在 OpenAI chat 格式与 Responses `function_call` / `function_call_output` 之间的转换。新增 `AGENT_CODEX_OAUTH_MODEL`，留空继承 `CODEX_OAUTH_MODEL`，可让问股与报告生成使用不同型号。
+- [新功能] 新增 Yahoo Finance 新闻兜底源（无需 API Key、无配额）：按标的直接取新闻，排在计费检索源与 SearXNG 之后。此前 Tavily 免费额度耗尽、Brave 月度额度用尽、自建 SearXNG 的 google/startpage/duckduckgo 引擎被 CAPTCHA 与限流拦截时，个股与大盘分析会在「零新闻」状态下进行；该源保证这种情况下仍有新闻输入。大盘复盘按 region 取对应指数（美股 ^GSPC/^IXIC）的新闻，`search_stock_news()` 相应新增可选 `region` 参数。美股与港股覆盖良好，A 股仅有英文媒体的零星报道。
 
 ## [3.27.0] - 2026-07-19
 

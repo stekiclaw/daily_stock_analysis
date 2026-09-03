@@ -128,7 +128,12 @@ def test_downgrades_buy_mid_range_with_neutral_fund_flow() -> None:
     assert "资金流不明确" in result.risk_warning
 
 
-def test_downgrades_buy_when_capital_flow_is_unavailable() -> None:
+def test_keeps_buy_when_market_intentionally_has_no_capital_flow_source() -> None:
+    """A market that never publishes capital flow is a coverage gap, not evidence.
+
+    US/HK/JP/KR stocks report ``not_supported`` for every request, so downgrading
+    on it would permanently forbid a buy outside A-shares.
+    """
     buy_result = _result(
         decision_type="buy",
         operation_advice="买入",
@@ -154,6 +159,33 @@ def test_downgrades_buy_when_capital_flow_is_unavailable() -> None:
         _unsupported_fund_flow(),
     )
 
+    assert buy_result.decision_type == "buy"
+    assert buy_result.operation_advice == "买入"
+    assert buy_result.sentiment_score == 66
+    assert buy_result.dashboard["decision_stability"]["applied"] is False
+    assert "未使用资金流校准" in buy_result.dashboard["decision_stability"]["reason"]
+    assert "暂不支持" in buy_result.dashboard["decision_stability"]["capital_flow_status"]
+    assert sell_result.decision_type == "sell"
+    assert sell_result.operation_advice == "卖出"
+    assert sell_result.dashboard["decision_stability"]["applied"] is False
+    assert "未使用资金流校准" in sell_result.dashboard["decision_stability"]["reason"]
+
+
+def test_downgrades_buy_when_supported_capital_flow_is_empty() -> None:
+    """A provider that does support the data but returned nothing stays conservative."""
+    buy_result = _result(
+        decision_type="buy",
+        operation_advice="买入",
+        score=66,
+        current_price=32.0,
+    )
+
+    stabilize_decision_with_structure(
+        buy_result,
+        SimpleNamespace(support_levels=[30.0], resistance_levels=[34.0]),
+        {"capital_flow": {"status": "ok", "data": {}}},
+    )
+
     assert buy_result.decision_type == "hold"
     assert buy_result.operation_advice == "持有观察"
     assert buy_result.confidence_level == "低"
@@ -161,10 +193,6 @@ def test_downgrades_buy_when_capital_flow_is_unavailable() -> None:
     assert buy_result.dashboard["decision_stability"]["applied"] is True
     assert "买入结论缺少资金面确认" in buy_result.dashboard["decision_stability"]["reason"]
     assert buy_result.dashboard["core_conclusion"]["signal_type"] == "🟡持有观望"
-    assert sell_result.decision_type == "sell"
-    assert sell_result.operation_advice == "卖出"
-    assert sell_result.dashboard["decision_stability"]["applied"] is False
-    assert "未使用资金流校准" in sell_result.dashboard["decision_stability"]["reason"]
 
 
 def test_downgrades_buy_when_capital_flow_values_are_na() -> None:
@@ -209,7 +237,7 @@ def test_downgrades_buy_advice_when_decision_type_is_hold_and_capital_flow_unava
     stabilize_decision_with_structure(
         result,
         SimpleNamespace(support_levels=[30.0], resistance_levels=[34.0]),
-        _unsupported_fund_flow(),
+        {"capital_flow": {"status": "ok", "data": {"stock_flow": {"main_net_inflow": "N/A"}}}},
     )
 
     assert result.decision_type == "hold"
@@ -219,7 +247,7 @@ def test_downgrades_buy_advice_when_decision_type_is_hold_and_capital_flow_unava
     assert "买入结论缺少资金面确认" in result.dashboard["decision_stability"]["reason"]
 
 
-def test_downgrades_buy_when_capital_flow_status_is_unavailable_case_insensitive() -> None:
+def test_unsupported_capital_flow_status_is_recognized_case_insensitively() -> None:
     buy_result = _result(
         decision_type="buy",
         operation_advice="买入",
@@ -233,9 +261,9 @@ def test_downgrades_buy_when_capital_flow_status_is_unavailable_case_insensitive
         _unsupported_fund_flow_caps(),
     )
 
-    assert buy_result.decision_type == "hold"
-    assert buy_result.operation_advice == "持有观察"
-    assert buy_result.dashboard["decision_stability"]["applied"] is True
+    assert buy_result.decision_type == "buy"
+    assert buy_result.operation_advice == "买入"
+    assert buy_result.dashboard["decision_stability"]["applied"] is False
     assert "暂不支持" in str(buy_result.dashboard["decision_stability"]["capital_flow_status"])
 
 

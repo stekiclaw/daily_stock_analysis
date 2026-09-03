@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { API_BASE_URL } from '../utils/constants';
+import { API_BASE_URL, withAppBasePath } from '../utils/constants';
 import { attachParsedApiError } from './error';
 
 const apiClient = axios.create({
@@ -16,9 +16,10 @@ apiClient.interceptors.response.use(
   (error) => {
     if (error.response?.status === 401) {
       const path = window.location.pathname + window.location.search;
-      if (!path.startsWith('/login')) {
+      const loginPath = withAppBasePath('/login');
+      if (!window.location.pathname.startsWith(loginPath)) {
         const redirect = encodeURIComponent(path);
-        window.location.assign(`/login?redirect=${redirect}`);
+        window.location.assign(`${loginPath}?redirect=${redirect}`);
       }
     }
     attachParsedApiError(error);

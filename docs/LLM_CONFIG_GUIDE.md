@@ -42,7 +42,7 @@ AGENT_BACKEND=auto
 AGENT_GENERATION_BACKEND=auto
 ```
 
-- `GENERATION_BACKEND=litellm|codex_cli|claude_code_cli|opencode_cli`。本地 CLI backend 是 generation backend，不是 LiteLLM provider；不要写 `LITELLM_MODEL=codex_cli/...`、`LITELLM_MODEL=claude_code_cli/...` 或 `LITELLM_MODEL=opencode_cli/...`。
+- `GENERATION_BACKEND=litellm|codex_cli|claude_code_cli|opencode_cli|codex_oauth`。本地 CLI backend 是 generation backend，不是 LiteLLM provider；不要写 `LITELLM_MODEL=codex_cli/...`、`LITELLM_MODEL=claude_code_cli/...` 或 `LITELLM_MODEL=opencode_cli/...`。
 - `GENERATION_BACKEND=opencode_cli` 时默认不传 `--model`，由本机 OpenCode 使用自身默认模型配置；`OPENCODE_CLI_MODEL` 只是可选覆盖值，配置时才作为单个 `--model` 参数传给 OpenCode。provider 认证、账号和模型可用性由本机 OpenCode 自身配置负责；DSA 不接管这些配置。
 - `GENERATION_FALLBACK_BACKEND` 未配置时默认 `litellm`；本地 `.env` 显式空值 `GENERATION_FALLBACK_BACKEND=` 表示禁用 backend-level fallback；primary 与 fallback 相同时解析为 no-op。仓库自带 GitHub Actions workflow 未配置该变量时会显式导出 `litellm`，如果要在 Actions 中禁用 backend fallback，请把 fallback 设为 primary backend，例如 `GENERATION_BACKEND=codex_cli` + `GENERATION_FALLBACK_BACKEND=codex_cli`。
 - `GENERATION_BACKEND=codex_cli|claude_code_cli` 且没有 Gemini/OpenAI/Anthropic/DeepSeek API Key 时，普通分析和大盘复盘仍会尝试本地 CLI backend；如果对应 executable 不存在，会返回结构化 `command_not_found`，不会报“API Key 未配置”。
@@ -58,6 +58,54 @@ AGENT_GENERATION_BACKEND=auto
 - Phase 6a 的 DSA Tool Surface 仍是唯一工具 schema、权限元数据、scope guard、结构化错误和审计/脱敏边界；Phase 6 的 Codex AgentBackend 只能通过该 Tool Surface 执行工具。`codex_cli` / `claude_code_cli` / `opencode_cli` 仍是 generation-only，不能作为 Agent tool fallback。
 - Web 设置页的生成后端快速检查只读取已保存的 `.env`、运行时兜底值和未保存草稿；它不会写配置、重载运行时，也不会发起真实模型请求。`available` 只表示当前配置具备尝试运行的条件。JSON 冒烟测试是单独的显式操作，会使用服务端固定的 JSON 提示词和 schema 发起一次真实的生成后端请求，用于验证提取器、JSON 契约、超时、输出限制和 usage-unavailable 语义。
 - `GET /api/v1/system/config/generation-backends/status` 只读取已保存配置；未保存草稿需调用 `POST /api/v1/system/config/generation-backends/status/preview` 或 `POST /api/v1/system/config/generation-backends/smoke-test`。被遮罩的密钥字段会继续沿用已保存值。`health_status` 与 `last_error_code/message` 只代表本次计算结果，不是历史持久健康状态。
+
+### codex_oauth：用 ChatGPT/Codex 订阅直连
+
+`GENERATION_BACKEND=codex_oauth` 让 DSA 自己持有一份 Codex OAuth 凭证，直接调用 ChatGPT 后端的
+Responses 接口。它和 `codex_cli` 的区别是：不需要本机安装并登录 Codex CLI，凭证由 DSA 自己保存和续期，
+因此可以显式选择模型、上报真实 token 用量。整条链路不消耗按量计费的 `OPENAI_API_KEY`。
+
+```env
+GENERATION_BACKEND=codex_oauth
+# 可选，默认值如下
+# CODEX_OAUTH_AUTH_FILE=data/codex_oauth/auth.json
+# CODEX_OAUTH_MODEL=gpt-5.6-terra
+# CODEX_OAUTH_REASONING_EFFORT=medium
+```
+
+授权有两种方式，二选一即可。
+
+**方式一：Web 设置页（推荐）**
+
+打开「设置 → AI 模型接入」，在 **OpenAI-OAuth（ChatGPT/Codex 订阅）** 卡片点「开始授权」，
+页面会显示验证链接和设备码；在浏览器里确认后本页自动变为「已授权」，并显示账号、套餐和凭证有效期。
+「快速添加渠道」的服务商下拉里也有 OpenAI-OAuth 入口，选中后会引导到同一张卡片——
+它不是 LiteLLM 渠道，不需要填 Base URL 和 API Key，也不会生成 `LLM_*` 配置。
+
+授权完成后，把「分析生成方式」改为 **OpenAI-OAuth** 并保存。
+
+**方式二：终端**（无图形界面的服务器同样适用，只要有别的设备能打开浏览器）：
+
+```bash
+python scripts/codex_oauth_login.py            # 打印验证链接与设备码，等待浏览器确认
+python scripts/codex_oauth_login.py --status   # 查看账号、套餐与 token 有效期
+python scripts/codex_oauth_login.py --force    # 换绑账号
+```
+
+- 凭证默认写入 `data/codex_oauth/auth.json`，文件权限 `0600`。Docker 部署中 `data/` 是挂载卷，
+  所以重建容器不会丢登录态。
+- 终端授权在**宿主机的仓库目录**里执行即可：`data/` 是宿主与容器共享的挂载卷，宿主写入的凭证容器直接可读
+  （容器内运行用户与宿主属主同为 uid 1000）。运行时镜像不包含 `scripts/`，不要在容器内执行该脚本；
+  容器化部署想在页面上授权，直接用上面的 Web 设置页方式。
+- access_token 在到期前 120 秒自动用 refresh_token 续期；请求中途遇到 401 会刷新后重试一次，
+  仍失败则返回结构化 `login_required`，提示重新授权。
+- 该后端是 **generation-only**：普通分析和大盘复盘可用，Agent 工具调用不支持，
+  `AGENT_GENERATION_BACKEND` 手写 `codex_oauth` 会返回明确的 unsupported 诊断，Agent 仍走 LiteLLM。
+- 上游接口只提供流式响应；DSA 在内部消费完整个流后返回完整文本，因此不对外暴露 streaming 能力。
+- 配置 `GENERATION_FALLBACK_BACKEND=litellm` 时，授权失效、限流、超时等失败都会回退到 LiteLLM。
+- 它不是离线模型：股票代码、新闻、持仓上下文、分析 prompt 和报告草稿会由 OpenAI 处理。
+- 该接口是 OpenAI 的私有 Codex 协议，会随官方客户端版本漂移；出现 400/403 时优先核对模型名与
+  `src/llm/codex_oauth.py` 中的客户端标识常量。
 
 ### Codex 本地 Agent（Phase 6 实验原型）
 

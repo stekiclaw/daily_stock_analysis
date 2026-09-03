@@ -30,6 +30,7 @@ from src.services.runtime_scheduler import (
     RUNTIME_SCHEDULER_TIMEOUT_ENV,
     RuntimeSchedulerService,
     _run_scheduled_analysis_process,
+    build_decision_signal_outcome_background_tasks,
 )
 
 
@@ -641,6 +642,45 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
             service.reconcile_from_config()
 
         self.assertEqual(calls, ["run"])
+
+    def test_decision_signal_outcome_background_task_is_opt_in_and_bounded(self) -> None:
+        disabled = SimpleNamespace(decision_signal_outcome_tracking_enabled=False)
+        self.assertEqual(
+            build_decision_signal_outcome_background_tasks(
+                disabled,
+                config_provider=lambda: disabled,
+            ),
+            [],
+        )
+
+        config = SimpleNamespace(
+            decision_signal_outcome_tracking_enabled=True,
+            decision_signal_outcome_interval_minutes=45,
+            decision_signal_outcome_batch_limit=123,
+        )
+        fake_service = MagicMock()
+        fake_service.run_outcomes.return_value = {
+            "evaluated": 4,
+            "created": 3,
+            "updated": 1,
+            "skipped": 0,
+        }
+
+        with patch(
+            "src.services.decision_signal_outcome_service.DecisionSignalOutcomeService",
+            return_value=fake_service,
+        ):
+            tasks = build_decision_signal_outcome_background_tasks(
+                config,
+                config_provider=lambda: config,
+            )
+
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["name"], "decision_signal_outcomes")
+        self.assertEqual(tasks[0]["interval_seconds"], 45 * 60)
+        self.assertTrue(tasks[0]["run_immediately"])
+        tasks[0]["task"]()
+        fake_service.run_outcomes.assert_called_once_with(limit=123)
 
     def test_background_task_active_requires_live_registered_scheduler(self) -> None:
         service = RuntimeSchedulerService()

@@ -97,7 +97,7 @@ class RunFlowSummary(BaseModel):
     elapsed_ms: Optional[int] = Field(None, ge=0, description="Observed elapsed time")
     bottleneck_node_id: Optional[str] = Field(None, description="Node with the longest observed duration")
     failed_attempts: int = Field(0, ge=0, description="Failed provider/model/history/notification attempts")
-    fallback_count: int = Field(0, ge=0, description="Fallback or retry transitions")
+    fallback_count: int = Field(0, ge=0, description="True provider fallback transitions before primary success")
     model: Optional[str] = Field(None, description="Sanitized model name observed in diagnostics")
     data_source_count: int = Field(0, ge=0, description="Data source nodes represented in the graph")
     event_count: int = Field(0, ge=0, description="Event count")

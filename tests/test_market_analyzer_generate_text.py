@@ -10,6 +10,7 @@ Covers:
   does NOT trigger AttributeError (regression guard for the old bypass bug)
 """
 import json
+import re
 import sys
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -3185,6 +3186,81 @@ class TestMarketAnalyzerBypassFix:
         assert result.text == "复盘结果"
         ma.analyzer.generate_text_with_metadata.assert_called_once()
 
+    def test_market_news_deduplicates_results_across_query_dimensions(self):
+        from src.market_analyzer import MarketAnalyzer
+
+        first = SimpleNamespace(
+            title="Same market headline",
+            source="Outlet A",
+            url="https://example.com/article?utm_source=one",
+            snippet="first",
+        )
+        second = SimpleNamespace(
+            title="Second market headline",
+            source="Outlet B",
+            url="https://example.com/second",
+            snippet="second",
+        )
+        duplicate_with_tracking = SimpleNamespace(
+            title="Same market headline",
+            source="Outlet A",
+            url="https://example.com/article?utm_source=two",
+            snippet="first",
+        )
+        search_service = MagicMock()
+        search_service.search_stock_news.side_effect = [
+            SimpleNamespace(results=[first, second]),
+            SimpleNamespace(results=[duplicate_with_tracking, second]),
+            SimpleNamespace(results=[first, second]),
+        ]
+        analyzer = MarketAnalyzer.__new__(MarketAnalyzer)
+        analyzer.search_service = search_service
+        analyzer.profile = SimpleNamespace(news_queries=["q1", "q2", "q3"])
+        analyzer.region = "us"
+        analyzer.config = SimpleNamespace(report_language="zh")
+
+        results = analyzer.search_market_news()
+
+        assert results == [first, second]
+        assert search_service.search_stock_news.call_count == 3
+
+    def test_market_review_uses_provider_trading_date_and_missing_turnover(self):
+        from src.market_analyzer import MarketAnalyzer, MarketIndex
+
+        indices = [
+            MarketIndex(
+                code="SPX",
+                name="S&P 500",
+                data_date="2026-08-28",
+                amount=None,
+                source="yfinance",
+            ),
+            MarketIndex(
+                code="IXIC",
+                name="Nasdaq",
+                data_date="2026-08-28",
+                amount=None,
+                source="yfinance",
+            ),
+            # The volatility index does not define the equity review date.
+            MarketIndex(
+                code="VIX",
+                name="VIX",
+                data_date="2026-08-29",
+                amount=None,
+                source="yfinance",
+            ),
+        ]
+
+        assert MarketAnalyzer._effective_index_data_date(
+            indices,
+            fallback="2026-08-31",
+        ) == "2026-08-28"
+        payload = indices[0].to_dict()
+        assert payload["amount"] is None
+        assert payload["data_date"] == "2026-08-28"
+        assert payload["source"] == "yfinance"
+
     def test_generate_text_none_falls_back_to_template(self):
         """generate_market_review() falls back to template when generate_text returns None."""
         from src.market_analyzer import MarketOverview, MarketIndex
@@ -4419,6 +4495,90 @@ Index text.
         assert "URL: https://example.com/redirect?" in prompt
         assert ("x" * 220) not in prompt
 
+    def test_nonfinite_us_indices_render_as_missing_and_do_not_create_risk_on_signal(self):
+        import numpy as np
+
+        from src.core.market_profile import US_PROFILE
+        from src.core.market_strategy import get_market_strategy_blueprint
+        from src.market_analyzer import MarketIndex, MarketOverview
+
+        ma = self._make_market_analyzer_with_mock_generate_text(return_value="review")
+        ma.region = "us"
+        ma.profile = US_PROFILE
+        ma.strategy = get_market_strategy_blueprint("us")
+        ma.config.report_language = "en"
+        unavailable = float("nan")
+        overview = MarketOverview(
+            date="2026-08-29",
+            indices=[
+                MarketIndex(
+                    code="SPX",
+                    name="S&P 500",
+                    current=unavailable,
+                    change=unavailable,
+                    change_pct=unavailable,
+                    open=unavailable,
+                    high=unavailable,
+                    low=unavailable,
+                    amount=unavailable,
+                    amplitude=unavailable,
+                ),
+                MarketIndex(code="IXIC", name="Nasdaq", current=unavailable, change_pct=unavailable),
+                MarketIndex(code="DJI", name="Dow Jones", current=unavailable, change_pct=unavailable),
+                # VIX remains useful context, but its direction is inverse to equities
+                # and cannot make missing core equity indices "available".
+                MarketIndex(code="VIX", name="CBOE Volatility Index", current=14.51, change_pct=0.0),
+            ],
+            top_sectors=[
+                {
+                    "name": "Technology",
+                    "change_pct": float("nan"),
+                    "is_active": np.bool_(True),
+                    "rank": np.int64(1),
+                }
+            ],
+            bottom_concepts=[
+                {
+                    "name": "Risk",
+                    "change_pct": float("inf"),
+                    "flags": np.array([True, False], dtype=np.bool_),
+                }
+            ],
+        )
+
+        table = ma._build_indices_block(overview)
+        prompt = ma._build_review_prompt(overview, [])
+        snapshot = ma.build_market_light_snapshot(overview)
+        payload = ma.build_market_review_payload(
+            overview,
+            [],
+            "# US Market Review\n\nCore equity index data was unavailable.",
+            market_light_snapshot=snapshot,
+        )
+        serialized_indices = json.dumps(
+            [index.to_dict() for index in overview.indices],
+            allow_nan=False,
+        )
+        serialized_payload = json.dumps(payload, allow_nan=False)
+
+        assert "| S&P 500 | N/A | ⚪ N/A | N/A | N/A | N/A | N/A | N/A |" in table
+        assert "nan" not in table.lower()
+        assert re.search(r"(?<![a-z])nan(?![a-z])", prompt.lower()) is None
+        assert '"current": null' in serialized_indices
+        assert '"change_pct": null' in serialized_indices
+        assert '"change_pct": null' in serialized_payload
+        assert payload["sectors"]["top"][0]["change_pct"] is None
+        assert payload["sectors"]["top"][0]["is_active"] is True
+        assert payload["sectors"]["top"][0]["rank"] == 1
+        assert payload["concepts"]["bottom"][0]["change_pct"] is None
+        assert payload["concepts"]["bottom"][0]["flags"] == [True, False]
+        assert snapshot["status"] == "yellow"
+        assert snapshot["score"] == 50
+        assert snapshot["data_quality"] == "unavailable"
+        assert snapshot["dimensions"]["index"] == {"score": 50, "available": False}
+        assert not any("average major-index change" in reason for reason in snapshot["reasons"])
+        assert not any("nan" in reason.lower() for reason in snapshot["reasons"])
+
     def test_market_light_snapshot_marks_defensive_market_red(self):
         from src.market_analyzer import MarketIndex, MarketOverview
 
@@ -4752,3 +4912,36 @@ Index text.
         assert violations == [], (
             f"market_analyzer.py still accesses private Analyzer attributes: {violations}"
         )
+
+    @pytest.mark.parametrize(
+        ("formatter", "zero_output"),
+        [
+            ("_format_optional_number", "0.00"),
+            ("_format_optional_pct", "0.00%"),
+            ("_format_optional_whole", "0"),
+        ],
+    )
+    def test_optional_market_formatters_preserve_zero_and_reject_nonfinite(
+        self,
+        formatter,
+        zero_output,
+    ):
+        from src.market_analyzer import MarketAnalyzer
+
+        format_value = getattr(MarketAnalyzer, formatter)
+        assert format_value(0) == zero_output
+        assert format_value(None) == "N/A"
+        assert format_value(float("nan")) == "N/A"
+        assert format_value(float("inf")) == "N/A"
+        assert format_value("-Infinity") == "N/A"
+
+    def test_turnover_formatter_preserves_zero_and_rejects_nonfinite(self):
+        from src.market_analyzer import MarketAnalyzer
+
+        analyzer = MarketAnalyzer.__new__(MarketAnalyzer)
+        analyzer.region = "us"
+
+        assert analyzer._format_turnover_value(0) == "0.00"
+        assert analyzer._format_turnover_value(None) == "N/A"
+        assert analyzer._format_turnover_value(float("nan")) == "N/A"
+        assert analyzer._format_turnover_value(float("inf")) == "N/A"

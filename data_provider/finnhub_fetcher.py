@@ -26,7 +26,10 @@ _FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 
 class FinnhubFetcher(BaseFetcher):
     name = "FinnhubFetcher"
-    priority = 2
+    # 可配置：/stock/candle（日线）在 Finnhub 免费层会返回 403，而公司新闻等
+    # 端点仍可用。免费层部署可设 FINNHUB_PRIORITY=9 把它排到美股日线链路末尾，
+    # 避免每次分析都先打一次必失败的请求并触发熔断；付费层保持默认值即可。
+    priority = int(os.getenv("FINNHUB_PRIORITY", "2"))
 
     def __init__(self):
         from src.config import get_config
@@ -131,7 +134,7 @@ class FinnhubFetcher(BaseFetcher):
 
         return UnifiedRealtimeQuote(
             code=symbol,
-            source=RealtimeSource.FALLBACK,
+            source=RealtimeSource.FINNHUB,
             price=price,
             change_pct=round(change_pct, 2) if change_pct is not None else None,
             change_amount=round(change_amount, 4) if change_amount is not None else None,

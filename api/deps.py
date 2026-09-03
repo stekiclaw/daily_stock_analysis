@@ -20,6 +20,7 @@ from src.config import get_config, Config
 from src.services.system_config_service import SystemConfigService
 from src.services.runtime_scheduler import RuntimeSchedulerService
 from src.services.agent_chat_session_service import AgentChatSessionService
+from src.services.codex_oauth_login_service import CodexOAuthLoginService
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -75,6 +76,23 @@ def get_system_config_service(request: Request) -> SystemConfigService:
     if service is None:
         service = SystemConfigService()
         request.app.state.system_config_service = service
+    return service
+
+
+def get_codex_oauth_login_service(request: Request) -> CodexOAuthLoginService:
+    """Get app-lifecycle shared CodexOAuthLoginService instance.
+
+    Shared because device-login sessions live in memory: a per-request instance
+    would lose the session between starting the login and polling it.
+    """
+    service = getattr(request.app.state, "codex_oauth_login_service", None)
+    if service is None:
+        service = CodexOAuthLoginService(
+            auth_file_provider=lambda: getattr(
+                Config.get_instance(), "codex_oauth_auth_file", ""
+            )
+        )
+        request.app.state.codex_oauth_login_service = service
     return service
 
 

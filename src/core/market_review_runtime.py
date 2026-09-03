@@ -12,7 +12,7 @@ from typing import Any, Optional, Tuple
 
 from src.config import Config
 from src.llm.backend_registry import (
-    LOCAL_CLI_GENERATION_BACKEND_IDS,
+    NON_LITELLM_GENERATION_BACKEND_IDS,
     resolve_generation_backend_id,
     resolve_generation_fallback_backend_id,
 )
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 def has_configured_llm_runtime(config: Config) -> bool:
     """Return whether any LLM model configuration is available."""
     try:
-        if resolve_generation_backend_id(config) in LOCAL_CLI_GENERATION_BACKEND_IDS:
+        if resolve_generation_backend_id(config) in NON_LITELLM_GENERATION_BACKEND_IDS:
             return True
     except GenerationError:
         pass
@@ -104,6 +104,15 @@ def build_market_review_runtime(
                 config,
                 "searxng_public_instances_enabled",
                 False,
+            ),
+            yfinance_news_enabled=getattr(config, "yfinance_news_enabled", True),
+            finnhub_news_keys=(
+                [getattr(config, "finnhub_api_key", None)]
+                if getattr(config, "finnhub_api_key", None)
+                else []
+            ),
+            etf_constituent_news_enabled=getattr(
+                config, "etf_constituent_news_enabled", False
             ),
             news_max_age_days=getattr(config, "news_max_age_days", 3),
             news_strategy_profile=getattr(config, "news_strategy_profile", "short"),

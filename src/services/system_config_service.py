@@ -2254,6 +2254,21 @@ class SystemConfigService:
                 )
             )
 
+        shadowed_keys = sorted(
+            key
+            for key in submitted_keys
+            if Config.bootstrap_process_env_shadows(key, current_map.get(key, ""))
+        )
+        if shadowed_keys:
+            warnings.append(
+                (
+                    f"{', '.join(shadowed_keys)} 已保存并对当前进程生效，但启动时的进程环境变量里存在同名变量"
+                    "（常见于 Docker 的 env_file / environment，或 shell export）。"
+                    "进程重启后环境变量会重新覆盖本次保存的值，导致设置悄悄回滚；"
+                    "要让它持久生效，请同步修改注入这些变量的来源（例如宿主机 .env）并重建容器。"
+                )
+            )
+
         return warnings
 
     @staticmethod

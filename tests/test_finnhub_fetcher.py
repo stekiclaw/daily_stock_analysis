@@ -125,7 +125,10 @@ class TestFinnhubFetcherRealtimeQuote(unittest.TestCase):
         })
         quote = self.fetcher.get_realtime_quote('AAPL')
         self.assertIsNotNone(quote)
+        from data_provider.realtime_types import RealtimeSource
+
         self.assertEqual(quote.code, 'AAPL')
+        self.assertIs(quote.source, RealtimeSource.FINNHUB)
         self.assertAlmostEqual(quote.price, 150.0)
         self.assertAlmostEqual(quote.change_pct, 1.35)
 

@@ -155,3 +155,33 @@ def test_manager_records_failed_chip_attempt_and_falls_back_to_next_fetcher():
         "provider_run_started",
         "provider_run",
     ]
+
+
+class TestChipDistributionUnsupportedMarket:
+    """Coverage for DataFetcherManager.is_chip_distribution_unsupported_market.
+
+    筹码分布 depends on akshare's A股专属 ``stock_cyq_em`` interface. US/HK
+    stocks and ETF/index codes never have this data by design (not a fetch
+    failure), and callers use this to avoid scoring that as a data-quality
+    problem.
+    """
+
+    def test_us_stock_is_unsupported(self):
+        manager = DataFetcherManager(fetchers=[])
+        assert manager.is_chip_distribution_unsupported_market("NBIS") is True
+        assert manager.is_chip_distribution_unsupported_market("AAPL") is True
+
+    def test_hk_stock_is_unsupported(self):
+        manager = DataFetcherManager(fetchers=[])
+        assert manager.is_chip_distribution_unsupported_market("HK00700") is True
+        assert manager.is_chip_distribution_unsupported_market("00700.HK") is True
+
+    def test_etf_is_unsupported(self):
+        manager = DataFetcherManager(fetchers=[])
+        # 510050 (华夏上证50ETF) - a real CN-listed ETF code.
+        assert manager.is_chip_distribution_unsupported_market("510050") is True
+
+    def test_plain_a_share_stock_is_supported(self):
+        manager = DataFetcherManager(fetchers=[])
+        assert manager.is_chip_distribution_unsupported_market("600519") is False
+        assert manager.is_chip_distribution_unsupported_market("000001") is False

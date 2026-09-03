@@ -130,8 +130,17 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             {"label": "Codex CLI (experimental)", "value": "codex_cli"},
             {"label": "Claude Code CLI (experimental)", "value": "claude_code_cli"},
             {"label": "OpenCode CLI (experimental)", "value": "opencode_cli"},
+            {"label": "OpenAI-OAuth (ChatGPT/Codex subscription)", "value": "codex_oauth"},
         ],
-        "validation": {"enum": ["litellm", "codex_cli", "claude_code_cli", "opencode_cli"]},
+        "validation": {
+            "enum": [
+                "litellm",
+                "codex_cli",
+                "claude_code_cli",
+                "opencode_cli",
+                "codex_oauth",
+            ]
+        },
         "display_order": 0,
         "help_key": "settings.ai_model.GENERATION_BACKEND",
         "examples": [
@@ -139,7 +148,115 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             "GENERATION_BACKEND=codex_cli",
             "GENERATION_BACKEND=claude_code_cli",
             "GENERATION_BACKEND=opencode_cli",
+            "GENERATION_BACKEND=codex_oauth",
         ],
+        "docs": [
+            {
+                "label": "LLM 配置指南",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/LLM_CONFIG_GUIDE.md",
+            },
+        ],
+        "warning_codes": [],
+    },
+    "CODEX_OAUTH_MODEL": {
+        "title": "OpenAI-OAuth Model",
+        "description": "Model used when the analysis generation method is OpenAI-OAuth.",
+        "category": "ai_model",
+        "data_type": "string",
+        "ui_control": "text",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "gpt-5.6-terra",
+        "display_order": 1,
+        "help_key": "settings.ai_model.CODEX_OAUTH_MODEL",
+        "examples": [
+            "CODEX_OAUTH_MODEL=gpt-5.6-terra",
+            "CODEX_OAUTH_MODEL=gpt-5.6-sol",
+            "CODEX_OAUTH_MODEL=gpt-5.6-luna",
+        ],
+        "docs": [
+            {
+                "label": "LLM 配置指南",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/LLM_CONFIG_GUIDE.md",
+            },
+        ],
+        "warning_codes": [],
+    },
+    "AGENT_CODEX_OAUTH_MODEL": {
+        "title": "Ask-Stock OpenAI-OAuth Model",
+        "description": (
+            "Model the ask-stock Agent uses when its backend is OpenAI-OAuth. "
+            "Leave empty to inherit CODEX_OAUTH_MODEL, or set it to run ask-stock "
+            "on a different model than report generation."
+        ),
+        "category": "agent",
+        "data_type": "string",
+        "ui_control": "text",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": None,
+        "options": [],
+        "validation": {},
+        "display_order": 3,
+        "help_key": "settings.agent.AGENT_CODEX_OAUTH_MODEL",
+        "examples": [
+            "AGENT_CODEX_OAUTH_MODEL=gpt-5.6-terra",
+            "AGENT_CODEX_OAUTH_MODEL=gpt-5.6-sol",
+        ],
+        "docs": [
+            {
+                "label": "LLM 配置指南",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/LLM_CONFIG_GUIDE.md",
+            },
+        ],
+        "warning_codes": [],
+    },
+    "CODEX_OAUTH_REASONING_EFFORT": {
+        "title": "OpenAI-OAuth Reasoning Effort",
+        "description": "Reasoning effort passed to the OpenAI-OAuth generation backend.",
+        "category": "ai_model",
+        "data_type": "string",
+        "ui_control": "select",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "medium",
+        "options": [
+            {"label": "None", "value": "none"},
+            {"label": "Low", "value": "low"},
+            {"label": "Medium", "value": "medium"},
+            {"label": "High", "value": "high"},
+        ],
+        "validation": {"enum": ["none", "low", "medium", "high"]},
+        "display_order": 2,
+        "help_key": "settings.ai_model.CODEX_OAUTH_REASONING_EFFORT",
+        "examples": ["CODEX_OAUTH_REASONING_EFFORT=medium"],
+        "docs": [
+            {
+                "label": "LLM 配置指南",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/LLM_CONFIG_GUIDE.md",
+            },
+        ],
+        "warning_codes": [],
+    },
+    "CODEX_OAUTH_AUTH_FILE": {
+        "title": "OpenAI-OAuth Credential Path",
+        "description": (
+            "Where the OAuth credential is stored. Keep it inside a mounted volume so "
+            "the authorization survives container rebuilds."
+        ),
+        "category": "ai_model",
+        "data_type": "string",
+        "ui_control": "text",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "data/codex_oauth/auth.json",
+        "display_order": 3,
+        "help_key": "settings.ai_model.CODEX_OAUTH_AUTH_FILE",
+        "examples": ["CODEX_OAUTH_AUTH_FILE=data/codex_oauth/auth.json"],
         "docs": [
             {
                 "label": "LLM 配置指南",
@@ -297,7 +414,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "LITELLM_MODEL": {
         "title": "Primary Model",
-        "description": "Primary model in provider/model format (e.g. gemini/gemini-3.1-pro-preview, deepseek/deepseek-v4-flash, anthropic/claude-sonnet-4-6). If empty, it is auto-inferred from available API keys or channel declarations.",
+        "description": "Primary LiteLLM model in provider/model format (e.g. gemini/gemini-3.1-pro-preview, deepseek/deepseek-v4-flash, anthropic/claude-sonnet-4-6). If empty, it is auto-inferred from available API keys or channel declarations. Used for reports only while the analysis generation method is LiteLLM; otherwise it serves the fallback backend and the ask-stock Agent path.",
         "category": "ai_model",
         "data_type": "string",
         "ui_control": "text",
@@ -1182,6 +1299,46 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "options": [],
         "validation": {},
         "display_order": 53,
+    },
+    "YFINANCE_NEWS_ENABLED": {
+        "title": "Yahoo Finance News Fallback",
+        "description": (
+            "Fetch per-symbol headlines from Yahoo Finance when the metered search "
+            "providers are exhausted or blocked. No API key and no quota. Best coverage "
+            "for US equities, ETFs and indices; A-share coverage is sparse. Default: false - "
+            "enable it to keep news flowing when the metered providers run dry."
+        ),
+        "category": "data_source",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 54,
+    },
+    "ETF_CONSTITUENT_NEWS_ENABLED": {
+        "title": "ETF Constituent News Fallback",
+        "description": (
+            "When an ETF has no news of its own, fetch news for its top holdings instead. "
+            "Thinly covered and leveraged/inverse ETFs routinely go weeks without a headline "
+            "under their own ticker, yet their price is driven by the constituents. No API key "
+            "and no quota. Only fires when the fund-level sources return nothing, and results "
+            "are attributed to the holding they came from. Leveraged/inverse funds holding only "
+            "cash collateral still resolve to nothing. Default: false."
+        ),
+        "category": "data_source",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 55,
     },
     "ENABLE_REALTIME_QUOTE": {
         "title": "Enable Realtime Quote",
@@ -3868,14 +4025,16 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             {"label": "Auto (recommended)", "value": "auto"},
             {"label": "Default model settings", "value": "litellm"},
             {"label": "Codex local Agent (experimental)", "value": "codex_app_server"},
+            {"label": "OpenAI-OAuth (ChatGPT/Codex subscription)", "value": "codex_oauth"},
         ],
-        "validation": {"enum": ["auto", "litellm", "codex_app_server"]},
+        "validation": {"enum": ["auto", "litellm", "codex_app_server", "codex_oauth"]},
         "display_order": 2,
         "help_key": "settings.agent.AGENT_BACKEND",
         "examples": [
             "AGENT_BACKEND=auto",
             "AGENT_BACKEND=litellm",
             "AGENT_BACKEND=codex_app_server",
+            "AGENT_BACKEND=codex_oauth",
         ],
         "docs": [
             {
@@ -4498,6 +4657,84 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         ],
         "warning_codes": ["legacy_json_only_basic_rules"],
     },
+    "DECISION_SIGNAL_OUTCOME_TRACKING_ENABLED": {
+        "title": "Decision Signal Outcome Tracking",
+        "description": "Evaluate pending DecisionSignal outcomes periodically while schedule mode is running.",
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 72,
+        "help_key": "settings.system.decision_signal_outcomes",
+        "examples": [
+            "DECISION_SIGNAL_OUTCOME_TRACKING_ENABLED=true",
+            "DECISION_SIGNAL_OUTCOME_INTERVAL_MINUTES=360",
+        ],
+        "docs": [
+            {
+                "label": "DecisionSignal 决策信号专题",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/decision-signals.md",
+            },
+        ],
+        "warning_codes": [],
+    },
+    "DECISION_SIGNAL_OUTCOME_INTERVAL_MINUTES": {
+        "title": "Decision Signal Outcome Interval",
+        "description": "Polling interval in minutes for DecisionSignal outcome maintenance.",
+        "category": "system",
+        "data_type": "integer",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "360",
+        "options": [],
+        "validation": {"min": 1, "max": 10080},
+        "display_order": 73,
+        "help_key": "settings.system.decision_signal_outcomes",
+        "examples": [
+            "DECISION_SIGNAL_OUTCOME_INTERVAL_MINUTES=360",
+            "DECISION_SIGNAL_OUTCOME_INTERVAL_MINUTES=60",
+        ],
+        "docs": [
+            {
+                "label": "DecisionSignal 决策信号专题",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/decision-signals.md",
+            },
+        ],
+        "warning_codes": [],
+    },
+    "DECISION_SIGNAL_OUTCOME_BATCH_LIMIT": {
+        "title": "Decision Signal Outcome Batch Limit",
+        "description": "Maximum number of signals evaluated in one scheduled maintenance run.",
+        "category": "system",
+        "data_type": "integer",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "500",
+        "options": [],
+        "validation": {"min": 1, "max": 500},
+        "display_order": 74,
+        "help_key": "settings.system.decision_signal_outcomes",
+        "examples": [
+            "DECISION_SIGNAL_OUTCOME_BATCH_LIMIT=500",
+            "DECISION_SIGNAL_OUTCOME_BATCH_LIMIT=100",
+        ],
+        "docs": [
+            {
+                "label": "DecisionSignal 决策信号专题",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/decision-signals.md",
+            },
+        ],
+        "warning_codes": [],
+    },
 }
 
 _DOC_FULL_GUIDE_ENV = [
@@ -4758,6 +4995,24 @@ _FIELD_HELP_METADATA: Dict[str, Dict[str, Any]] = {
         ],
         "docs": _DOC_FULL_GUIDE_SEARCH,
         "warning_codes": ["public_instance_stability"],
+    },
+    "YFINANCE_NEWS_ENABLED": {
+        "help_key": "settings.data_source.SEARXNG_BASE_URLS",
+        "examples": [
+            "YFINANCE_NEWS_ENABLED=true",
+            "YFINANCE_NEWS_ENABLED=false",
+        ],
+        "docs": _DOC_FULL_GUIDE_SEARCH,
+        "warning_codes": [],
+    },
+    "ETF_CONSTITUENT_NEWS_ENABLED": {
+        "help_key": "settings.data_source.SEARXNG_BASE_URLS",
+        "examples": [
+            "ETF_CONSTITUENT_NEWS_ENABLED=true",
+            "ETF_CONSTITUENT_NEWS_ENABLED=false",
+        ],
+        "docs": _DOC_FULL_GUIDE_SEARCH,
+        "warning_codes": [],
     },
     "BIAS_THRESHOLD": {
         "help_key": "settings.data_source.BIAS_THRESHOLD",

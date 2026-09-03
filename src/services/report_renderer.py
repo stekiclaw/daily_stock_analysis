@@ -42,6 +42,9 @@ from src.schemas.decision_action import (
     localize_action_label,
 )
 from src.utils.data_processing import (
+    display_fraction_as_percent,
+    display_numeric_with_suffix,
+    display_value_or_na,
     normalize_model_used,
     signal_attribution_has_content,
     signal_attribution_weight_items,
@@ -58,14 +61,10 @@ def _escape_md(text: str) -> str:
 
 
 def _clean_sniper_value(val: Any) -> str:
-    """Format sniper point value for display (strip label prefixes)."""
-    if val is None:
-        return "N/A"
-    if isinstance(val, (int, float)):
-        return str(val)
-    s = str(val).strip() if val else ""
-    if not s or s == "N/A":
-        return s or "N/A"
+    """Format sniper point values without exposing invalid numeric tokens."""
+    s = display_value_or_na(val)
+    if s == "N/A":
+        return s
     prefixes = [
         "理想买入点：", "次优买入点：", "止损位：", "目标位：",
         "理想买入点:", "次优买入点:", "止损位:", "目标位:",
@@ -73,7 +72,7 @@ def _clean_sniper_value(val: Any) -> str:
     ]
     for prefix in prefixes:
         if s.startswith(prefix):
-            return s[len(prefix):]
+            return display_value_or_na(s[len(prefix):])
     return s
 
 
@@ -245,6 +244,11 @@ def render(
         "localize_conflict_severity": localize_conflict_severity,
         "normalize_strategy_synthesis_payload": normalize_strategy_synthesis_payload,
         "strategy_invalid_opinion_count": strategy_invalid_opinion_count,
+        # dashboard 由模型产出，缺数据时是显式 null，Jinja 的 get(key, default)
+        # 与 dict.get 一样只在 key 缺失时生效，直接插值会渲染出字面量 None。
+        "display_value_or_na": display_value_or_na,
+        "display_numeric_with_suffix": display_numeric_with_suffix,
+        "display_fraction_as_percent": display_fraction_as_percent,
         "signal_attribution_has_content": signal_attribution_has_content,
         "signal_attribution_weight_items": signal_attribution_weight_items,
     }

@@ -761,6 +761,126 @@ class MarketReviewLocalizationTestCase(unittest.TestCase):
         self.assertNotIn("+3.25% |## HK Market", markdown)
         self.assertNotIn("+2.18% |---", markdown)
 
+    def test_market_review_context_quality_keeps_normal_payload_available(self) -> None:
+        overview = market_review_module._build_market_review_context_overview(
+            region="us",
+            report_language="zh",
+            diagnostic_snapshot=None,
+            market_review_payload={
+                "region": "us",
+                "market_light": {
+                    "dimensions": {
+                        "index": {"score": 60, "available": True},
+                    },
+                    # US breadth/limit dimensions are structurally unsupported;
+                    # finite equity-index direction still makes this block available.
+                    "data_quality": "partial",
+                },
+            },
+        )
+
+        self.assertEqual(overview["blocks"][0]["status"], "available")
+        self.assertEqual(overview["counts"]["available"], 1)
+        self.assertEqual(overview["data_quality"]["level"], "good")
+        self.assertEqual(overview["data_quality"]["overall_score"], 100)
+        self.assertEqual(
+            overview["metadata"]["market_light_data_quality"],
+            ["partial"],
+        )
+
+    def test_market_review_context_derives_direction_without_market_light(self) -> None:
+        available = market_review_module._build_market_review_context_overview(
+            region="jp",
+            report_language="zh",
+            diagnostic_snapshot=None,
+            market_review_payload={
+                "region": "jp",
+                "indices": [
+                    {
+                        "code": "N225",
+                        "name": "Nikkei 225",
+                        "change_pct": 0.68,
+                    }
+                ],
+            },
+        )
+        unavailable = market_review_module._build_market_review_context_overview(
+            region="kr",
+            report_language="zh",
+            diagnostic_snapshot=None,
+            market_review_payload={
+                "region": "kr",
+                "indices": [
+                    {
+                        "code": "KS11",
+                        "name": "KOSPI",
+                        "change_pct": float("nan"),
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(available["blocks"][0]["status"], "available")
+        self.assertEqual(available["data_quality"]["overall_score"], 100)
+        self.assertEqual(unavailable["blocks"][0]["status"], "partial")
+        self.assertEqual(unavailable["data_quality"]["overall_score"], 75)
+        self.assertIn(
+            "market_direction_data_unavailable",
+            unavailable["warnings"],
+        )
+
+    def test_vix_only_payload_does_not_count_as_equity_direction(self) -> None:
+        overview = market_review_module._build_market_review_context_overview(
+            region="us",
+            report_language="zh",
+            diagnostic_snapshot=None,
+            market_review_payload={
+                "region": "us",
+                "indices": [
+                    {
+                        "code": "VIX",
+                        "name": "CBOE Volatility Index",
+                        "change_pct": -3.2,
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(overview["blocks"][0]["status"], "partial")
+        self.assertEqual(overview["data_quality"]["overall_score"], 75)
+
+    def test_combined_market_review_context_degrades_if_one_market_is_unavailable(self) -> None:
+        overview = market_review_module._build_market_review_context_overview(
+            region="cn,us",
+            report_language="zh",
+            diagnostic_snapshot=None,
+            market_review_payload={
+                "region": "cn,us",
+                "markets": {
+                    "cn": {
+                        "market_light": {
+                            "dimensions": {"index": {"available": True}},
+                            "data_quality": "partial",
+                        }
+                    },
+                    "us": {
+                        "market_light": {
+                            "dimensions": {"index": {"available": False}},
+                            "data_quality": "unavailable",
+                        }
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(overview["blocks"][0]["status"], "partial")
+        self.assertEqual(overview["counts"]["partial"], 1)
+        self.assertEqual(overview["data_quality"]["overall_score"], 75)
+        self.assertEqual(
+            overview["metadata"]["market_light_data_quality"],
+            ["partial", "unavailable"],
+        )
+
     def test_persist_market_review_history_saves_markdown_report(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             old_db_path = os.environ.get("DATABASE_PATH")
@@ -778,18 +898,18 @@ class MarketReviewLocalizationTestCase(unittest.TestCase):
                         "cn": {
                             "region": "cn",
                             "trade_date": "2026-03-06",
-                            "status": "red",
-                            "score": 30,
-                            "label": "偏防守",
-                            "temperature_label": "偏弱",
-                            "reasons": ["test"],
+                            "status": "yellow",
+                            "score": 50,
+                            "label": "中性",
+                            "temperature_label": "中性",
+                            "reasons": ["core index data unavailable"],
                             "guidance": "test",
                             "dimensions": {
-                                "breadth": {"score": 20, "available": True},
-                                "index": {"score": 30, "available": True},
-                                "limit": {"score": 10, "available": True},
+                                "breadth": {"score": 50, "available": False},
+                                "index": {"score": 50, "available": False},
+                                "limit": {"score": 50, "available": False},
                             },
-                            "data_quality": "ok",
+                            "data_quality": "unavailable",
                         }
                     },
                     market_review_payload={
@@ -797,6 +917,12 @@ class MarketReviewLocalizationTestCase(unittest.TestCase):
                         "kind": "market_review",
                         "region": "cn",
                         "sections": [{"title": "今日大盘", "markdown": "复盘正文"}],
+                        "market_light": {
+                            "dimensions": {
+                                "index": {"score": 50, "available": False},
+                            },
+                            "data_quality": "unavailable",
+                        },
                     },
                 )
 
@@ -819,7 +945,15 @@ class MarketReviewLocalizationTestCase(unittest.TestCase):
                     snapshot = json.loads(row.context_snapshot or "{}")
                     self.assertEqual(snapshot["market_review_region"], "cn")
                     self.assertEqual(snapshot["market_review_payload"]["region"], "cn")
-                    self.assertIn("analysis_context_pack_overview", snapshot)
+                    overview = snapshot["analysis_context_pack_overview"]
+                    self.assertEqual(overview["blocks"][0]["status"], "partial")
+                    self.assertEqual(overview["counts"]["partial"], 1)
+                    self.assertEqual(overview["data_quality"]["level"], "usable")
+                    self.assertEqual(overview["data_quality"]["overall_score"], 75)
+                    self.assertIn(
+                        "market_direction_data_unavailable",
+                        overview["warnings"],
+                    )
             finally:
                 DatabaseManager.reset_instance()
                 Config._instance = None

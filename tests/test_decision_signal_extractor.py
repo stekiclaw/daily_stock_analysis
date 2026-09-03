@@ -306,6 +306,90 @@ def test_build_payload_keeps_high_neutral_action_with_guardrail_reason() -> None
     assert payload["metadata"]["guardrail_reason"] == "持有/观望待回踩"
 
 
+def test_build_payload_ignores_unapplied_stability_reason() -> None:
+    result = _result(
+        sentiment_score=65,
+        operation_advice="持有",
+        decision_type="hold",
+        action=None,
+    )
+    dashboard = result.dashboard or {}
+    dashboard["decision_stability"] = {
+        "applied": False,
+        "reason": "资金流不可用，未使用资金流校准",
+    }
+    result.dashboard = dashboard
+
+    payload = build_decision_signal_payload_from_report(
+        result,
+        trace_id="trace-unapplied-stability",
+        query_source="api",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is not None
+    assert payload["action"] == "buy"
+    assert payload["metadata"]["raw_action"] == "hold"
+    assert payload["metadata"]["final_action"] == "buy"
+    assert payload["metadata"]["action_adjustment_reason"] == "canonical_score_alignment"
+    assert "guardrail_reason" not in payload["metadata"]
+
+
+def test_build_payload_keeps_applied_stability_reason() -> None:
+    result = _result(
+        sentiment_score=65,
+        operation_advice="持有",
+        decision_type="hold",
+        action=None,
+    )
+    dashboard = result.dashboard or {}
+    dashboard["decision_stability"] = {
+        "applied": True,
+        "reason": "资金流转弱，已按风险规则降级",
+    }
+    result.dashboard = dashboard
+
+    payload = build_decision_signal_payload_from_report(
+        result,
+        trace_id="trace-applied-stability",
+        query_source="api",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is not None
+    assert payload["action"] == "hold"
+    assert payload["metadata"]["raw_action"] == "hold"
+    assert payload["metadata"]["final_action"] == "hold"
+    assert payload["metadata"]["guardrail_reason"] == "资金流转弱，已按风险规则降级"
+    assert "action_adjustment_reason" not in payload["metadata"]
+
+
+def test_build_payload_preserves_explicit_action_when_legacy_fields_disagree() -> None:
+    result = _result(
+        sentiment_score=65,
+        operation_advice="持有",
+        decision_type="hold",
+        action="buy",
+    )
+
+    payload = build_decision_signal_payload_from_report(
+        result,
+        trace_id="trace-explicit-action-conflict",
+        query_source="api",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is not None
+    assert payload["action"] == "buy"
+    assert payload["metadata"]["raw_action"] == "buy"
+    assert payload["evidence"]["operation_advice"] == "持有"
+    assert payload["evidence"]["decision_type"] == "hold"
+    assert "action_adjustment_reason" not in payload["metadata"]
+
+
 def test_build_payload_uses_stability_calibration_raw_and_adjusted_scores() -> None:
     result = _result(
         sentiment_score=59,

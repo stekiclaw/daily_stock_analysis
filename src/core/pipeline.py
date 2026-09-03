@@ -13,6 +13,7 @@ A股自选股智能分析系统 - 核心分析流水线
 
 import logging
 import inspect
+import math
 import threading
 import time
 from pathlib import Path
@@ -88,6 +89,7 @@ from src.services.run_diagnostics import (
     record_llm_run,
     record_llm_run_started,
     record_notification_run,
+    record_provider_run,
     reset_run_diagnostic_context,
     sanitize_diagnostic_text,
 )
@@ -141,6 +143,68 @@ def _share_image_payload(result: Any) -> Optional[Dict[str, Any]]:
         logger.debug("构建分享图片结构化数据失败，回退 Markdown: %s", exc)
         return None
     return payload if isinstance(payload, dict) and payload else None
+
+
+def is_confirmed_non_trading_day(market_phase_context: Optional[Dict[str, Any]]) -> bool:
+    """只有市场阶段明确判定为非交易日才算数；phase 未知时保持失败开放。
+
+    与 ``_enhance_context`` 中 ``today`` 覆盖护栏使用同一判定，避免两处语义漂移。
+    """
+    return (
+        isinstance(market_phase_context, dict)
+        and market_phase_context.get("is_trading_day") is False
+    )
+
+
+def resolve_result_price_change(
+    realtime_data: Optional[Dict[str, Any]],
+    daily_bar: Optional[Dict[str, Any]],
+    market_phase_context: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[float], Optional[float]]:
+    """解析写入 ``AnalysisResult`` 与快照的「当前价 / 涨跌幅」。
+
+    交易日（含盘中与盘后）沿用实时报价，行为不变。
+
+    ``is_trading_day`` 明确为 False 时，实时报价只是上一交易日的收盘快照，
+    其 ``change_pct`` 由 provider 自带的 ``pre_close`` 反推，而该 ``pre_close``
+    可能落后一个交易日，于是同一份报告的表头和正文会给出两个涨跌幅。
+    实例：MSFT 2026-08-28，provider ``pre_close=503.09`` → ``+2.08%``；
+    官方日线前收 505.06 → ``+1.68%``（``today.pct_chg``）。
+    此时改用官方日线的 ``close`` / ``pct_chg``，与 ``_enhance_context`` 中
+    ``today`` 不做实时覆盖的护栏保持一致；官方日线缺字段时逐字段回退实时报价。
+
+    Returns:
+        (current_price, change_pct)
+    """
+    def _finite_number(value: Any) -> Optional[float]:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return numeric_value if math.isfinite(numeric_value) else None
+
+    realtime = realtime_data if isinstance(realtime_data, dict) else {}
+    price = _finite_number(realtime.get("price"))
+    change_pct = _finite_number(realtime.get("change_pct"))
+
+    if not is_confirmed_non_trading_day(market_phase_context):
+        return price, change_pct
+    if not isinstance(daily_bar, dict) or not daily_bar:
+        return price, change_pct
+    # 非交易日仍拿到 realtime 估算 bar 时不做二次覆盖：此时 today 本身就来自实时报价，
+    # 官方日线并不存在，沿用实时值即可（正常路径下该护栏已阻止覆盖）。
+    if daily_bar.get("is_estimated"):
+        return price, change_pct
+
+    official_close = _finite_number(daily_bar.get("close"))
+    official_pct = _finite_number(daily_bar.get("pct_chg"))
+    if official_close is not None:
+        price = official_close
+    if official_pct is not None:
+        change_pct = official_pct
+    return price, change_pct
 
 
 def _supports_explicit_keyword(callable_obj: Any, keyword: str) -> bool:
@@ -309,6 +373,15 @@ class StockAnalysisPipeline:
                 minimax_keys=self.config.minimax_api_keys,
                 searxng_base_urls=self.config.searxng_base_urls,
                 searxng_public_instances_enabled=self.config.searxng_public_instances_enabled,
+                yfinance_news_enabled=getattr(self.config, "yfinance_news_enabled", True),
+                finnhub_news_keys=(
+                    [self.config.finnhub_api_key]
+                    if getattr(self.config, "finnhub_api_key", None)
+                    else []
+                ),
+                etf_constituent_news_enabled=getattr(
+                    self.config, "etf_constituent_news_enabled", False
+                ),
                 news_max_age_days=self.config.news_max_age_days,
                 news_strategy_profile=getattr(self.config, "news_strategy_profile", "short"),
             )
@@ -406,9 +479,25 @@ class StockAnalysisPipeline:
             )
 
             # 断点续传检查：如果最新可复用交易日的数据已存在，则跳过
+            resume_check_start = time.time()
             if not force_refresh and self.db.has_today_data(code, target_date):
                 logger.info(
                     f"{stock_name}({code}) {target_date} 数据已存在，跳过获取（断点续传）"
+                )
+                # 断点续传命中本地存储：不请求外部数据源，但仍要记录一次成功的
+                # 数据来源，否则运行诊断会把“数据其实已具备”误报成“未记录诊断信息”。
+                record_provider_run(
+                    data_type="daily_data",
+                    provider="LocalStorage",
+                    operation="resume_local_daily_data",
+                    success=True,
+                    latency_ms=int((time.time() - resume_check_start) * 1000),
+                    cache_hit=True,
+                    data_date=(
+                        target_date.isoformat()
+                        if isinstance(target_date, date)
+                        else None
+                    ),
                 )
                 return True, None
 
@@ -536,21 +625,14 @@ class StockAnalysisPipeline:
             if not stock_name:
                 stock_name = f'股票{code}'
 
-            # Step 2: 获取筹码分布 - 使用统一入口，带熔断保护
-            # 指数目标跳过筹码分布（INDEX_SKIP_MODULES 能力矩阵）
-            chip_data = None
-            if is_index and "chip_distribution" in INDEX_SKIP_MODULES:
-                logger.debug(f"{stock_name}({code}) 指数目标跳过筹码分布")
-            else:
-                try:
-                    chip_data = self.fetcher_manager.get_chip_distribution(code)
-                    if chip_data:
-                        logger.info(f"{stock_name}({code}) 筹码分布: 获利比例={chip_data.profit_ratio:.1%}, "
-                                  f"90%集中度={chip_data.concentration_90:.2%}")
-                    else:
-                        logger.debug(f"{stock_name}({code}) 筹码分布获取失败或已禁用")
-                except Exception as e:
-                    logger.warning(f"{stock_name}({code}) 获取筹码分布失败: {e}")
+            # Step 2: 获取筹码分布 - 使用统一入口，带熔断保护。
+            # 先做能力判定，结构性不覆盖的美股/港股/ETF/指数不得实际调用
+            # A 股专属的 Akshare 筹码接口，也不得留下伪造的 provider failure。
+            chip_data, chip_not_supported = self._fetch_chip_distribution_for_target(
+                code=code,
+                stock_name=stock_name,
+                is_index=is_index,
+            )
 
             # If agent mode is explicitly enabled, or specific agent skills are configured, use the Agent analysis pipeline.
             # NOTE: use config.agent_mode (explicit opt-in) instead of
@@ -675,6 +757,7 @@ class StockAnalysisPipeline:
                     portfolio_context=portfolio_context,
                     market_structure_context=market_structure_context,
                     analysis_target=analysis_target,
+                    chip_not_supported=chip_not_supported,
                 )
 
             # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
@@ -810,6 +893,7 @@ class StockAnalysisPipeline:
                     realtime_quote=realtime_quote,
                     trend_result=trend_result,
                     chip_data=chip_data,
+                    chip_not_supported=chip_not_supported,
                     fundamental_context=fundamental_context,
                     news_context=news_context,
                     news_result_count=news_result_count,
@@ -891,8 +975,13 @@ class StockAnalysisPipeline:
                 self._emit_progress(94, f"{stock_name}：正在校验并整理分析结果")
                 result.query_id = query_id
                 realtime_data = enhanced_context.get('realtime', {})
-                result.current_price = realtime_data.get('price')
-                result.change_pct = realtime_data.get('change_pct')
+                # 非交易日不能用实时报价的涨跌幅覆盖官方日线，否则表头/历史列表与
+                # 正文给出两个数（result.change_pct 还会流入 DecisionSignal 与回测）。
+                result.current_price, result.change_pct = resolve_result_price_change(
+                    realtime_data,
+                    enhanced_context.get('today'),
+                    market_phase_context_dict,
+                )
 
             # Step 7.6: chip_structure fallback (Issue #589) and unavailable collapse
             if result:
@@ -1020,7 +1109,8 @@ class StockAnalysisPipeline:
             chip_data: 筹码分布数据
             trend_result: 趋势分析结果
             stock_name: 股票名称
-            market_phase_context: 已构建的市场阶段上下文，用于标记盘中 partial bar
+            market_phase_context: 已构建的市场阶段上下文，用于标记盘中 partial bar，
+                并在 is_trading_day 明确为 False 时跳过实时 today 覆盖
             
         Returns:
             增强后的上下文
@@ -1058,6 +1148,9 @@ class StockAnalysisPipeline:
                 'total_mv': getattr(realtime_quote, 'total_mv', None),
                 'circ_mv': getattr(realtime_quote, 'circ_mv', None),
                 'change_60d': getattr(realtime_quote, 'change_60d', None),
+                # The prompt renders prices with this unit; without it a US or HK
+                # quote falls back to the A-share 元 (RMB) label.
+                'currency': getattr(realtime_quote, 'currency', None),
                 'source': quote_source_name,
                 'fetched_at': getattr(realtime_quote, 'fetched_at', None),
                 'provider_timestamp': getattr(realtime_quote, 'provider_timestamp', None),
@@ -1097,7 +1190,19 @@ class StockAnalysisPipeline:
 
         # Issue #234：盘中分析使用实时 OHLC 与趋势 MA 覆盖 today。
         # 防护条件：trend_result.ma5 > 0 表示 MA 计算已成功且数据量充足。
-        if realtime_quote and trend_result and trend_result.ma5 > 0:
+        # 非交易日不覆盖，与 _augment_historical_with_realtime 的交易日护栏保持一致：
+        # 此时实时报价只是上一交易日的收盘快照，覆盖会把完整官方日线换成缺字段的估算
+        # bar，并让 technical 数据块被标成 partial/estimated。phase 未知时保持失败开放。
+        is_non_trading_day = (
+            isinstance(market_phase_context, dict)
+            and market_phase_context.get("is_trading_day") is False
+        )
+        if (
+            realtime_quote
+            and trend_result
+            and trend_result.ma5 > 0
+            and not is_non_trading_day
+        ):
             price = getattr(realtime_quote, 'price', None)
             if price is not None and price > 0:
                 yesterday_close = None
@@ -1419,6 +1524,44 @@ class StockAnalysisPipeline:
         except Exception as e:
             logger.warning("[%s] Agent history prefetch failed: %s", code, e)
 
+    def _fetch_chip_distribution_for_target(
+        self,
+        *,
+        code: str,
+        stock_name: str,
+        is_index: bool,
+    ) -> Tuple[Optional[ChipDistribution], bool]:
+        """Fetch chip data only where the underlying capability actually applies.
+
+        Cost-distribution data is backed by an A-share-only Akshare endpoint.  A
+        structural coverage gap is not a failed provider attempt, so capability
+        detection must happen before entering ``get_chip_distribution``.
+        """
+        if is_index and "chip_distribution" in INDEX_SKIP_MODULES:
+            logger.debug("%s(%s) 指数目标跳过筹码分布", stock_name, code)
+            return None, True
+
+        if self.fetcher_manager.is_chip_distribution_unsupported_market(code):
+            logger.debug("%s(%s) 当前市场/品种结构性不支持筹码分布，跳过 provider 调用", stock_name, code)
+            return None, True
+
+        try:
+            chip_data = self.fetcher_manager.get_chip_distribution(code)
+            if chip_data:
+                logger.info(
+                    "%s(%s) 筹码分布: 获利比例=%.1f%%, 90%%集中度=%.2f%%",
+                    stock_name,
+                    code,
+                    chip_data.profit_ratio * 100,
+                    chip_data.concentration_90 * 100,
+                )
+            else:
+                logger.debug("%s(%s) 筹码分布获取失败或已禁用", stock_name, code)
+            return chip_data, False
+        except Exception as exc:
+            logger.warning("%s(%s) 获取筹码分布失败: %s", stock_name, code, exc)
+            return None, False
+
     def _filter_agent_tools_for_index(self, executor: Any) -> Any:
         """Return an executor whose tool registry excludes index-incompatible tools.
 
@@ -1473,6 +1616,7 @@ class StockAnalysisPipeline:
         portfolio_context: Optional[Dict[str, Any]] = None,
         market_structure_context: Optional[Dict[str, Any]] = None,
         analysis_target: Optional[AnalysisTarget] = None,
+        chip_not_supported: bool = False,
     ) -> Optional[AnalysisResult]:
         """
         使用 Agent 模式分析单只股票。
@@ -1584,13 +1728,21 @@ class StockAnalysisPipeline:
                     query_id=query_id,
                     base_context=analysis_context,
                     portfolio_context=portfolio_context,
+                    chip_not_supported=chip_not_supported,
                 ),
                 report_language=report_language,
                 code=code,
                 query_id=query_id,
             )
             if analysis_context_pack_summary:
-                initial_context["analysis_context_pack_summary"] = analysis_context_pack_summary
+                initial_context["analysis_context_pack_summary"] = self._append_agent_runtime_news_note(
+                    analysis_context_pack_summary,
+                    report_language=report_language,
+                    search_available=bool(
+                        self.search_service is not None
+                        and self.search_service.is_available
+                    ),
+                )
 
             # 运行 Agent
             if report_language in ("en", "ko"):
@@ -1632,23 +1784,68 @@ class StockAnalysisPipeline:
                 trend_result=trend_result,
             )
 
-            # 三态计数取自 Agent 实际消费的搜索工具结果：渠道不可用为 None（未执行
-            # 检索），渠道可用则从 0 起步、拿到多少算多少。
-            if result is not None and news_evidence is not None:
-                result.news_result_count = news_evidence.resolve(
-                    search_available=bool(
-                        self.search_service is not None
-                        and self.search_service.is_available
-                    ),
+            # 三态计数、search_performed 和公开 context-pack 都必须取自 Agent
+            # 实际调用工具时返回的证据，不能取分析结束后的补查结果。
+            search_available = bool(
+                self.search_service is not None
+                and self.search_service.is_available
+            )
+            runtime_news_context = (
+                news_evidence.render_context()
+                if news_evidence is not None
+                else None
+            )
+            agent_news_content = self._merge_agent_news_context(
+                initial_context.get("news_context"),
+                runtime_news_context,
+            )
+            agent_news_result_count = (
+                news_evidence.resolve(search_available=search_available)
+                if news_evidence is not None
+                else None
+            )
+            if result is not None:
+                result.news_result_count = agent_news_result_count
+                result.search_performed = bool(
+                    news_evidence is not None and news_evidence.attempted
                 )
-                # 与普通路径同样按来源逐个登记：Agent 运行期自己搜到的条数、注入的
-                # 社交情绪、注入的本地资讯池。这条路径不经过 format_intel_report()，
-                # 但仍不传拼好的整段，避免以后有人往里加会造占位文本的来源。
+                # 与普通路径同样按来源逐个登记：Agent 运行期工具证据、注入的
+                # 社交情绪、注入的本地资讯池。只有真实内容才能令新闻块 available。
                 result.news_evidence_present = news_evidence_present(
-                    result.news_result_count,
+                    agent_news_result_count,
                     social_evidence_context,
                     persisted_intelligence_context,
+                    runtime_news_context,
                 )
+
+                final_agent_context = dict(initial_context)
+                if agent_news_content:
+                    final_agent_context["news_context"] = agent_news_content
+                else:
+                    final_agent_context.pop("news_context", None)
+                (
+                    _final_context_pack_summary,
+                    final_context_pack_overview,
+                ) = self._build_analysis_context_pack_outputs(
+                    self._build_agent_analysis_artifacts(
+                        code=code,
+                        stock_name=stock_name,
+                        market=market,
+                        phase=market_phase_context,
+                        initial_context=final_agent_context,
+                        fundamental_context=fundamental_context,
+                        query_id=query_id,
+                        base_context=analysis_context,
+                        portfolio_context=portfolio_context,
+                        chip_not_supported=chip_not_supported,
+                        news_result_count=agent_news_result_count,
+                    ),
+                    report_language=report_language,
+                    code=code,
+                    query_id=query_id,
+                )
+                if final_context_pack_overview is not None:
+                    analysis_context_pack_overview = final_context_pack_overview
             record_llm_run(
                 success=bool(result and getattr(result, "success", True)),
                 model=getattr(result, "model_used", None) if result else getattr(agent_result, "model", None),
@@ -1710,8 +1907,12 @@ class StockAnalysisPipeline:
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
                 realtime_data = initial_context.get("realtime_quote", {})
                 if isinstance(realtime_data, dict):
-                    result.current_price = realtime_data.get("price")
-                    result.change_pct = realtime_data.get("change_pct")
+                    # 与非 Agent 路径 Step 7.5 使用同一护栏，避免只修一个入口。
+                    result.current_price, result.change_pct = resolve_result_price_change(
+                        realtime_data,
+                        (analysis_context or {}).get("today"),
+                        market_phase_context,
+                    )
                 action_before_guardrail = getattr(result, "action", None)
                 advice_before_guardrail = getattr(result, "operation_advice", None)
                 stabilize_decision_with_structure(result, trend_result, fundamental_context)
@@ -1832,44 +2033,35 @@ class StockAnalysisPipeline:
 
             resolved_stock_name = result.name if result and result.name else stock_name
 
-            # 保存新闻情报到数据库（Agent 工具结果仅用于 LLM 上下文，未持久化，Fixes #396）
-            # 使用 search_stock_news（与 Agent 工具调用逻辑一致），仅 1 次 API 调用，无额外延迟
-            if self.search_service is not None and self.search_service.is_available:
-                try:
-                    news_response = self.search_service.search_stock_news(
-                        stock_code=("" if is_index else code),
-                        stock_name=resolved_stock_name,
-                        max_results=5
-                    )
-                    # 这次补查只为持久化新闻情报（Fixes #396），刻意不写
-                    # result.news_result_count：它发生在分析结束之后，与 Agent 实际
-                    # 消费的证据无关，用它做披露判定会两个方向都失真。真正的计数在
-                    # executor.run() 的证据作用域里收集（见上文）。
-                    if news_response.success and news_response.results:
-                        query_context = self._build_query_context(query_id=query_id)
-                        self.db.save_news_intel(
-                            code=code,
-                            name=resolved_stock_name,
-                            dimension="latest_news",
-                            query=news_response.query,
-                            response=news_response,
-                            query_context=query_context
-                        )
-                        logger.info(f"[{code}] Agent 模式: 新闻情报已保存 {len(news_response.results)} 条")
-                except Exception as e:
-                    logger.warning(f"[{code}] Agent 模式保存新闻情报失败: {e}")
+            # Agent 搜索工具已在调用时持久化它实际返回给模型的响应；这里不得再
+            # 补打一轮搜索，否则 diagnostics、配额消耗和历史快照会描述另一组证据。
 
             # 保存分析历史记录
             if result and result.success:
                 try:
+                    agent_snapshot_context = {
+                        **self._without_runtime_prompt_context(initial_context),
+                        "stock_name": resolved_stock_name,
+                    }
+                    if agent_news_content:
+                        agent_snapshot_context["news_context"] = agent_news_content
+                    else:
+                        agent_snapshot_context.pop("news_context", None)
+                    # Agent mode builds the authoritative daily-bar context after
+                    # ``initial_context``. Persist those bars in the history snapshot;
+                    # otherwise a non-trading-day result corrected in memory reverts
+                    # to the raw provider quote when the record is read later.
+                    if isinstance(analysis_context, dict):
+                        for key in ("date", "today", "yesterday"):
+                            if key in analysis_context:
+                                agent_snapshot_context[key] = analysis_context[key]
+
                     agent_context_snapshot = self._build_context_snapshot(
-                        enhanced_context={
-                            **self._without_runtime_prompt_context(initial_context),
-                            "stock_name": resolved_stock_name,
-                        },
-                        news_content=initial_context.get("news_context"),
+                        enhanced_context=agent_snapshot_context,
+                        news_content=agent_news_content,
                         realtime_quote=realtime_quote,
                         chip_data=chip_data,
+                        news_result_count=agent_news_result_count,
                         analysis_context_pack_overview=analysis_context_pack_overview,
                         market_phase_summary=market_phase_summary,
                     )
@@ -1879,7 +2071,7 @@ class StockAnalysisPipeline:
                         result=result,
                         query_id=query_id,
                         report_type=report_type.value,
-                        news_content=None,
+                        news_content=agent_news_content,
                         context_snapshot=agent_context_snapshot,
                         save_snapshot=self.save_context_snapshot,
                     )
@@ -3085,7 +3277,14 @@ class StockAnalysisPipeline:
         news_result_count: Optional[int],
         query_id: str,
         portfolio_context: Optional[Dict[str, Any]] = None,
+        chip_not_supported: bool = False,
     ) -> PipelineAnalysisArtifacts:
+        metadata: Dict[str, Any] = {
+            "query_id": query_id,
+            "trigger_source": self.query_source,
+        }
+        if chip_not_supported:
+            metadata["chip_not_supported"] = True
         return PipelineAnalysisArtifacts(
             code=code,
             stock_name=stock_name,
@@ -3099,10 +3298,7 @@ class StockAnalysisPipeline:
             fundamental_context=fundamental_context,
             news_context=news_context,
             news_result_count=news_result_count,
-            metadata={
-                "query_id": query_id,
-                "trigger_source": self.query_source,
-            },
+            metadata=metadata,
             portfolio_context=dict(portfolio_context) if isinstance(portfolio_context, dict) else None,
         )
 
@@ -3118,6 +3314,8 @@ class StockAnalysisPipeline:
         query_id: str,
         base_context: Optional[Dict[str, Any]] = None,
         portfolio_context: Optional[Dict[str, Any]] = None,
+        chip_not_supported: bool = False,
+        news_result_count: Optional[int] = None,
     ) -> PipelineAnalysisArtifacts:
         context_candidate = base_context
         if not isinstance(context_candidate, dict):
@@ -3136,6 +3334,13 @@ class StockAnalysisPipeline:
                 "yesterday": {},
             }
 
+        metadata: Dict[str, Any] = {
+            "query_id": query_id,
+            "trigger_source": self.query_source,
+        }
+        if chip_not_supported:
+            metadata["chip_not_supported"] = True
+
         return PipelineAnalysisArtifacts(
             code=code,
             stock_name=stock_name,
@@ -3148,13 +3353,38 @@ class StockAnalysisPipeline:
             chip_data=initial_context.get("chip_distribution"),
             fundamental_context=fundamental_context,
             news_context=initial_context.get("news_context"),
-            news_result_count=None,
-            metadata={
-                "query_id": query_id,
-                "trigger_source": self.query_source,
-            },
+            news_result_count=news_result_count,
+            metadata=metadata,
             portfolio_context=dict(portfolio_context) if isinstance(portfolio_context, dict) else None,
         )
+
+    @staticmethod
+    def _merge_agent_news_context(*parts: Optional[str]) -> Optional[str]:
+        merged = [str(part).strip() for part in parts if str(part or "").strip()]
+        return "\n\n".join(merged) if merged else None
+
+    @staticmethod
+    def _append_agent_runtime_news_note(
+        summary: str,
+        *,
+        report_language: str,
+        search_available: bool,
+    ) -> str:
+        """Prevent a pre-tool snapshot from being read as the final news state."""
+        if not summary or not search_available:
+            return summary
+        if str(report_language or "").lower() in {"en", "ko"}:
+            note = (
+                "- Agent runtime news rule: the news status above covers only preloaded "
+                "evidence. Check search-tool results before the final conclusion; if a "
+                "tool returns evidence, do not describe news as missing.\n"
+            )
+        else:
+            note = (
+                "- Agent 运行期新闻规则：上方新闻状态只表示工具调用前的预载证据；"
+                "最终结论必须检查搜索工具返回。工具已返回真实证据时，不得再写新闻缺失。\n"
+            )
+        return f"{summary.rstrip()}\n{note}"
 
     def _build_analysis_context_pack_outputs(
         self,

@@ -156,6 +156,7 @@ class ProviderRun:
     cache_hit: Optional[bool] = None
     stale_seconds: Optional[int] = None
     record_count: Optional[int] = None
+    data_date: Optional[str] = None
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
@@ -173,6 +174,7 @@ class ProviderRun:
             "cache_hit": self.cache_hit,
             "stale_seconds": self.stale_seconds,
             "record_count": self.record_count,
+            "data_date": self.data_date,
             "created_at": self.created_at,
         }
         return {key: value for key, value in payload.items() if value is not None}
@@ -650,21 +652,67 @@ def _provider_flow_event(
     data_type = _safe_event_key(run.data_type) or "provider"
     provider_key = _safe_event_key(run.provider) or "unknown"
     label = _DATA_TYPE_LABELS.get(data_type, data_type)
-    fallback = bool(run.fallback_from or run.fallback_to)
-    status = _flow_status_for_success(run.success, fallback=fallback)
+    same_type_runs = [
+        item
+        for item in context.provider_runs
+        if (_safe_event_key(item.data_type) or "provider") == data_type
+    ]
+    # One trace may execute the same provider chain multiple times (for example
+    # a market review requests three separate news queries).  A provider repeat
+    # after a successful primary starts a new chain; do not classify all later
+    # queries as supplements of the first query.
+    current_chain: List[ProviderRun] = []
+    seen_providers: set[str] = set()
+    chain_has_success = False
+    for item in same_type_runs:
+        item_provider = _safe_event_key(item.provider) or "unknown"
+        if item_provider in seen_providers and chain_has_success:
+            current_chain = []
+            seen_providers = set()
+            chain_has_success = False
+        current_chain.append(item)
+        seen_providers.add(item_provider)
+        chain_has_success = chain_has_success or bool(item.success)
+    preceding_runs = current_chain[:-1]
+    primary_already_succeeded = any(item.success for item in preceding_runs)
+    role = "supplement" if primary_already_succeeded else "primary"
+    run_payload = run.to_dict()
+    skipped = _is_skipped_provider_run(run_payload)
+    had_real_failure_before_success = any(
+        _is_real_provider_failure(item.to_dict()) for item in preceding_runs
+    )
+    if run.success:
+        fallback = not primary_already_succeeded and bool(
+            run.fallback_from or had_real_failure_before_success
+        )
+        status = _flow_status_for_success(True, fallback=fallback)
+    elif skipped:
+        status = _flow_status_for_success(False, skipped=True)
+    elif "timeout" in str(run.error_type or "").lower():
+        status = "timeout"
+    else:
+        status = "failed"
     node_id = f"provider_{data_type}_{provider_key}_{index}"
     started_at = _started_at_from_end_and_duration(run.created_at, run.latency_ms)
-    message = (
-        f"{label} {run.provider} 成功"
-        if run.success
-        else f"{label} {run.provider} 失败：{run.error_message_sanitized or run.error_type or '未知错误'}"
-    )
+    if run.success:
+        outcome = "补充成功" if role == "supplement" else "成功"
+        message = f"{label} {run.provider} {outcome}"
+        title = f"{label}{'补充完成' if role == 'supplement' else '成功'}"
+        severity = "success"
+    elif skipped:
+        message = f"{label} {run.provider} 跳过：{run.error_message_sanitized or run.error_type or '当前未配置或不适用'}"
+        title = f"{label}跳过"
+        severity = "info"
+    else:
+        message = f"{label} {run.provider} 失败：{run.error_message_sanitized or run.error_type or '未知错误'}"
+        title = f"{label}失败"
+        severity = "warning"
     return {
         "timestamp": run.created_at,
-        "severity": "success" if run.success else "warning",
+        "severity": severity,
         "type": "provider_run",
         "node_id": node_id,
-        "title": f"{label}{'成功' if run.success else '失败'}",
+        "title": title,
         "message": sanitize_diagnostic_text(message, max_length=220),
         "metadata": _clean_metadata(
             {
@@ -674,6 +722,7 @@ def _provider_flow_event(
                 "operation": run.operation,
                 "duration_ms": run.latency_ms,
                 "record_count": run.record_count,
+                "role": role,
                 "fallback_from": run.fallback_from,
                 "fallback_to": run.fallback_to,
                 "error_type": run.error_type,
@@ -689,6 +738,12 @@ def _provider_flow_event(
                     "duration_ms": run.latency_ms,
                     "record_count": run.record_count,
                     "message": message,
+                    "metadata": {
+                        "data_type": run.data_type,
+                        "operation": run.operation,
+                        "role": role,
+                        "error_type": run.error_type,
+                    },
                 },
             }
         ),
@@ -879,6 +934,7 @@ def record_provider_run(
     cache_hit: Optional[bool] = None,
     stale_seconds: Optional[int] = None,
     record_count: Optional[int] = None,
+    data_date: Optional[str] = None,
 ) -> None:
     """Append a provider attempt to the active context without affecting callers."""
     context = get_current_diagnostic_context()
@@ -901,6 +957,7 @@ def record_provider_run(
                 cache_hit=cache_hit,
                 stale_seconds=stale_seconds,
                 record_count=record_count,
+                data_date=data_date,
             )
         )
     except Exception as exc:  # pragma: no cover - defensive fail-open guard
@@ -1054,6 +1111,15 @@ _ANALYSIS_INPUT_STATUS_MESSAGES = {
     "fetch_failed": "输入块显示抓取失败",
     "not_supported": "输入块标记为不支持",
 }
+# 数据源“未配置/请求时不可用”，属于跳过而非失败，见 `_is_skipped_provider_run`。
+_SKIPPED_PROVIDER_ERROR_TYPES = {
+    "unavailable",
+    "not_available",
+    "not_configured",
+    "not_applicable",
+    "unsupported",
+    "skipped",
+}
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
@@ -1115,6 +1181,91 @@ def _analysis_input_status_message(block: Dict[str, Any]) -> Optional[str]:
     return _ANALYSIS_INPUT_STATUS_MESSAGES.get(status, f"输入块状态为 {status}")
 
 
+def _analysis_input_component(
+    context_snapshot: Dict[str, Any],
+) -> RunDiagnosticComponent:
+    """Summarize the same context-pack quality boundary shown by run flow."""
+    label = "分析输入"
+    overview = _analysis_context_overview(context_snapshot)
+    raw_blocks = overview.get("blocks")
+    if isinstance(raw_blocks, dict):
+        blocks = [block for block in raw_blocks.values() if isinstance(block, dict)]
+    elif isinstance(raw_blocks, list):
+        blocks = [block for block in raw_blocks if isinstance(block, dict)]
+    else:
+        blocks = []
+    if not blocks:
+        return _component("analysis_input", label, "unknown", "未记录分析输入上下文质量")
+
+    degraded_statuses = {
+        "fetch_failed",
+        "fallback",
+        "partial",
+        "stale",
+        "estimated",
+        "missing",
+    }
+    affected_blocks: List[Dict[str, Any]] = []
+    unsupported_blocks: List[Dict[str, Any]] = []
+    unknown_blocks: List[Dict[str, Any]] = []
+    available_count = 0
+    for block in blocks:
+        status = str(block.get("status") or "").strip()
+        item = {
+            "key": block.get("key"),
+            "label": block.get("label") or block.get("key"),
+            "status": status or "unknown",
+            "source": block.get("source"),
+            "missing_reasons": _list_text(block.get("missing_reasons")),
+        }
+        item = {key: value for key, value in item.items() if value not in (None, [], "")}
+        if status == "available":
+            available_count += 1
+        elif status in degraded_statuses:
+            affected_blocks.append(item)
+        elif status == "not_supported":
+            unsupported_blocks.append(item)
+        else:
+            unknown_blocks.append(item)
+
+    quality = _as_dict(overview.get("data_quality"))
+    details = {
+        "available_count": available_count,
+        "block_count": len(blocks),
+        "overall_score": quality.get("overall_score"),
+        "quality_level": quality.get("level"),
+        "counts": overview.get("counts") if isinstance(overview.get("counts"), dict) else None,
+        "affected_blocks": affected_blocks or None,
+        "not_supported_blocks": unsupported_blocks or None,
+        "unknown_blocks": unknown_blocks or None,
+    }
+    if affected_blocks:
+        affected_text = "、".join(
+            f"{item.get('label') or item.get('key')}（{_ANALYSIS_INPUT_STATUS_MESSAGES.get(str(item.get('status')), str(item.get('status')))}）"
+            for item in affected_blocks[:3]
+        )
+        return _component(
+            "analysis_input",
+            label,
+            "degraded",
+            f"分析输入存在 {len(affected_blocks)} 个降级块：{affected_text}",
+            details,
+        )
+    if unknown_blocks:
+        return _component(
+            "analysis_input",
+            label,
+            "unknown",
+            f"分析输入有 {len(unknown_blocks)} 个块状态未知",
+            details,
+        )
+
+    message = f"分析输入已组装，{available_count} 个块可用"
+    if unsupported_blocks:
+        message += f"，{len(unsupported_blocks)} 个块结构性不支持"
+    return _component("analysis_input", label, "ok", message, details)
+
+
 def _list_text(value: Any, *, limit: int = 5) -> List[str]:
     if not isinstance(value, list):
         return []
@@ -1158,6 +1309,132 @@ def _reconcile_daily_provider_with_analysis_input(
     )
 
 
+def _is_skipped_provider_run(run: Dict[str, Any]) -> bool:
+    """未配置/未启用的数据源：被跳过，而不是“失败”。
+
+    `data_provider` 在数据源缺少凭据、未安装依赖或请求时不可用时，会记录
+    `error_type="unavailable"` 的尝试。这类数据源根本没有发起请求，把它算成
+    失败会让“没有配置长桥/富途/Tushare”的部署永久显示降级。
+    """
+    if run.get("success") is not False:
+        return False
+    return str(run.get("error_type") or "").strip().lower() in _SKIPPED_PROVIDER_ERROR_TYPES
+
+
+def _is_real_provider_failure(run: Dict[str, Any]) -> bool:
+    """真实失败：数据源确实被调用过并且没有拿到可用数据。"""
+    return run.get("success") is False and not _is_skipped_provider_run(run)
+
+
+def _provider_names(runs: List[Dict[str, Any]]) -> List[str]:
+    names: List[str] = []
+    for run in runs:
+        name = str(run.get("provider") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _partition_repeated_provider_chains(
+    runs: List[Dict[str, Any]],
+) -> List[List[Dict[str, Any]]]:
+    """Split repeated searches into independent provider chains.
+
+    Market review performs several news queries in one diagnostic trace.  Once a
+    chain has succeeded, seeing one of its providers again marks the next query;
+    later failures must not be misclassified as supplements of the first query.
+    """
+    chains: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    seen_providers: set[str] = set()
+    chain_has_success = False
+    for run in runs:
+        provider = str(run.get("provider") or "unknown").strip().lower() or "unknown"
+        if provider in seen_providers and chain_has_success:
+            if current:
+                chains.append(current)
+            current = []
+            seen_providers = set()
+            chain_has_success = False
+        current.append(run)
+        seen_providers.add(provider)
+        chain_has_success = chain_has_success or run.get("success") is True
+    if current:
+        chains.append(current)
+    return chains
+
+
+def _market_review_news_count(context_snapshot: Dict[str, Any]) -> Optional[int]:
+    payload = context_snapshot.get("market_review_payload")
+    if not isinstance(payload, dict):
+        return None
+    markets = payload.get("markets")
+    payloads = (
+        [item for item in markets.values() if isinstance(item, dict)]
+        if isinstance(markets, dict)
+        else [payload]
+    )
+    found = False
+    count = 0
+    for item in payloads:
+        news = item.get("news")
+        if isinstance(news, list):
+            found = True
+            count += len(news)
+    return count if found else None
+
+
+def _news_provider_details(
+    provider_runs: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    runs = [
+        run for run in provider_runs
+        if isinstance(run, dict) and run.get("data_type") == "news_search"
+    ]
+    if not runs:
+        return {}
+
+    chains = _partition_repeated_provider_chains(runs)
+    fallback_count = 0
+    failed_attempts = 0
+    primary_successes: List[Dict[str, Any]] = []
+    for chain in chains:
+        first_success_index = next(
+            (index for index, run in enumerate(chain) if run.get("success") is True),
+            None,
+        )
+        if first_success_index is None:
+            failed_attempts += sum(1 for run in chain if _is_real_provider_failure(run))
+            continue
+        primary_successes.append(chain[first_success_index])
+        preceding_failures = [
+            run for run in chain[:first_success_index] if _is_real_provider_failure(run)
+        ]
+        if preceding_failures:
+            fallback_count += 1
+            failed_attempts += len(preceding_failures)
+
+    details: Dict[str, Any] = {
+        "attempts": len(runs),
+        "chain_count": len(chains),
+        "fallback_count": fallback_count,
+        "failed_attempts": failed_attempts,
+        "providers": _provider_names(primary_successes) or None,
+        "failed_providers": _provider_names(
+            [run for run in runs if _is_real_provider_failure(run)]
+        ) or None,
+        "skipped_providers": _provider_names(
+            [run for run in runs if _is_skipped_provider_run(run)]
+        ) or None,
+        "provider_record_count": sum(
+            int(run.get("record_count") or 0)
+            for run in primary_successes
+            if not isinstance(run.get("record_count"), bool)
+        ),
+    }
+    return {key: value for key, value in details.items() if value is not None}
+
+
 def _provider_component(
     *,
     key: str,
@@ -1172,29 +1449,63 @@ def _provider_component(
     if not runs:
         return _component(key, label, "unknown", f"{label}未记录诊断信息")
 
-    successes = [run for run in runs if run.get("success") is True]
-    failures = [run for run in runs if run.get("success") is False]
+    # provider_runs 按完成顺序追加（`record_provider_run_started` 只发实时事件，
+    # 不进入该列表），因此列表下标即真实尝试顺序。
+    first_success_index = next(
+        (index for index, run in enumerate(runs) if run.get("success") is True),
+        None,
+    )
     last_run = runs[-1]
-    if successes:
-        success_run = successes[-1]
+    if first_success_index is not None:
+        success_run = runs[first_success_index]
         provider = success_run.get("provider") or "unknown"
-        record_count = success_run.get("record_count")
+        # 只有“首个成功之前”的真实失败才是 fallback（降级）；首个成功之后的尝试
+        # 是 `_supplement_quote` 之类的字段补充，失败不影响本次数据来源与质量。
+        preceding_failures = [
+            run for run in runs[:first_success_index] if _is_real_provider_failure(run)
+        ]
+        skipped_providers = _provider_names(
+            [run for run in runs if _is_skipped_provider_run(run)]
+        )
+        cache_hit = success_run.get("cache_hit") is True
+        data_date = success_run.get("data_date")
         details = {
             "provider": provider,
             "attempts": len(runs),
-            "record_count": record_count,
+            "record_count": success_run.get("record_count"),
             "fallback_to": next(
-                (run.get("fallback_to") for run in failures if run.get("fallback_to")),
+                (
+                    run.get("fallback_to")
+                    for run in preceding_failures
+                    if run.get("fallback_to")
+                ),
                 None,
             ),
+            "cache_hit": True if cache_hit else None,
+            "data_date": data_date,
+            "skipped_providers": skipped_providers or None,
         }
-        details = {key: value for key, value in details.items() if value is not None}
-        if failures:
+        if preceding_failures:
+            details["failed_providers"] = _provider_names(preceding_failures)
+            details = {
+                key_: value for key_, value in details.items() if value is not None
+            }
             return _component(
                 key,
                 label,
                 "degraded",
                 f"{label}{provider} 成功，前置数据源失败后已继续",
+                details,
+            )
+
+        details = {key_: value for key_, value in details.items() if value is not None}
+        if cache_hit:
+            date_text = f"（数据日期 {data_date}）" if data_date else ""
+            return _component(
+                key,
+                label,
+                "ok",
+                f"{label}来自本地存储缓存{date_text}，本次未请求外部数据源",
                 details,
             )
         return _component(
@@ -1223,39 +1534,82 @@ def _provider_component(
     )
 
 
-def _news_component(context_snapshot: Dict[str, Any], raw_result: Dict[str, Any]) -> RunDiagnosticComponent:
+def _news_component(
+    context_snapshot: Dict[str, Any],
+    raw_result: Dict[str, Any],
+    provider_runs: List[Dict[str, Any]],
+) -> RunDiagnosticComponent:
     label = "新闻搜索"
     input_block = _analysis_input_block(context_snapshot, "news")
     input_message = _analysis_input_status_message(input_block)
     has_retrieval_news = "news_retrieval_content" in context_snapshot
     has_snapshot_news = has_retrieval_news or "news_content" in context_snapshot
+    provider_details = _news_provider_details(provider_runs)
+
     news_result_count = context_snapshot.get("news_result_count")
+    if not isinstance(news_result_count, int) or isinstance(news_result_count, bool):
+        raw_count = raw_result.get("news_result_count")
+        news_result_count = (
+            raw_count
+            if isinstance(raw_count, int) and not isinstance(raw_count, bool)
+            else _market_review_news_count(context_snapshot)
+        )
+
+    fallback_count = int(provider_details.get("fallback_count") or 0)
     if isinstance(news_result_count, int):
+        details = {"record_count": news_result_count, **provider_details}
         if news_result_count > 0:
             if input_message:
-                return _component(
-                    "news",
-                    label,
-                    "degraded",
-                    f"新闻检索返回 {news_result_count} 条结果，但新闻{input_message}；报告页相关资讯可能来自后续检索或历史持久化",
+                details.update(
                     {
-                        "record_count": news_result_count,
                         "analysis_input_block": "news",
                         "analysis_input_status": input_block.get("status"),
                         "analysis_input_missing_reasons": _list_text(
                             input_block.get("missing_reasons")
                         ),
                         "evidence_scope": "retrieval_vs_analysis_input",
-                    },
+                    }
+                )
+                return _component(
+                    "news",
+                    label,
+                    "degraded",
+                    f"新闻检索返回 {news_result_count} 条结果，但新闻{input_message}；报告页相关资讯可能来自后续检索或历史持久化",
+                    details,
+                )
+            if fallback_count:
+                return _component(
+                    "news",
+                    label,
+                    "degraded",
+                    f"新闻检索返回 {news_result_count} 条结果，{fallback_count} 次检索在前置数据源失败后降级成功",
+                    details,
                 )
             return _component(
                 "news",
                 label,
                 "ok",
                 f"新闻检索返回 {news_result_count} 条结果",
-                {"record_count": news_result_count},
+                details,
             )
-        return _component("news", label, "degraded", "新闻搜索无结果", {"record_count": 0})
+        return _component("news", label, "degraded", "新闻搜索无结果", details)
+
+    if provider_details:
+        provider_record_count = int(provider_details.get("provider_record_count") or 0)
+        if provider_record_count > 0:
+            status = "degraded" if fallback_count else "ok"
+            message = f"新闻数据源返回 {provider_record_count} 条结果，最终去重条数未记录"
+            if fallback_count:
+                message += f"；其中 {fallback_count} 次检索发生真实降级"
+            return _component("news", label, status, message, provider_details)
+        return _component(
+            "news",
+            label,
+            "degraded",
+            "新闻数据源已尝试，但未记录可用结果",
+            provider_details,
+        )
+
     if input_message:
         return _component(
             "news",
@@ -1437,6 +1791,7 @@ def build_run_diagnostic_summary(
         provider_runs=provider_runs,
     )
     components = {
+        "analysis_input": _analysis_input_component(snapshot),
         "realtime_quote": _provider_component(
             key="realtime_quote",
             label="实时行情",
@@ -1447,7 +1802,7 @@ def build_run_diagnostic_summary(
             daily_data_component,
             snapshot,
         ),
-        "news": _news_component(snapshot, raw),
+        "news": _news_component(snapshot, raw, provider_runs),
         "llm": _llm_component(diagnostics, raw),
         "notification": _notification_component(diagnostics),
         "history": _history_component(diagnostics, report_saved),

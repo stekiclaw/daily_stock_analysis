@@ -164,6 +164,7 @@ vi.mock('../../components/settings', () => ({
       {items.map((item) => `${item.key}=${item.value}`).join('|')}
     </div>
   ),
+  CodexOAuthPanel: () => <div data-testid="codex-oauth-panel" />,
   AgentBackendStatusPanel: ({
     items,
     selectedBackend,

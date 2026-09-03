@@ -74,6 +74,8 @@ Web 展示必须把这些 wire value 映射为当前 UI 语言的用户可读标
 - `GET /api/v1/decision-signals/latest/{stock_code}`：查询股票最新 active 信号。
 - `POST /api/v1/decision-signals/outcomes/run`：显式触发后验评估。
 - `GET /api/v1/decision-signals/outcomes`、`GET /api/v1/decision-signals/outcomes/stats`、`GET /api/v1/decision-signals/{signal_id}/outcomes`：查询后验结果与统计。
+
+在长运行 schedule 模式中可以自动维护 outcome：同时设置 `SCHEDULE_ENABLED=true` 和 `DECISION_SIGNAL_OUTCOME_TRACKING_ENABLED=true` 后，调度器会在启动时先运行一次，再按 `DECISION_SIGNAL_OUTCOME_INTERVAL_MINUTES`（默认 360 分钟）运行；每轮最多处理 `DECISION_SIGNAL_OUTCOME_BATCH_LIMIT`（默认 500，最大 500）条信号。任务只读取本地信号和 `StockDaily`，不会调用 LLM，也不会修改原始信号。关闭开关后仍可继续使用上述显式 API。
 - `GET/PUT /api/v1/decision-signals/{signal_id}/feedback`：查询或写入 useful / not useful 反馈。
 - `POST /api/v1/decision-signals/reassess`：基于来源历史报告快照重新计算不同决策风格下的信号；`persist=false` 只预览，`persist=true` 由服务端重算并保存通过 guardrail 的结果。
 

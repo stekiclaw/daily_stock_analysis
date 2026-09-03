@@ -133,7 +133,7 @@ class GenerationBackendStatus(BaseModel):
     """
 
     backend_id: str
-    backend_type: Literal["litellm", "local_cli"]
+    backend_type: Literal["litellm", "local_cli", "remote_oauth"]
     provider_id: str
     available: bool
     health_status: GenerationBackendHealthStatus = "not_tested"
@@ -377,6 +377,46 @@ class DiscoverLLMChannelModelsResponse(BaseModel):
     resolved_protocol: Optional[str] = None
     models: List[str] = Field(default_factory=list)
     latency_ms: Optional[int] = None
+
+
+class CodexOAuthStatusResponse(BaseModel):
+    """Current stored Codex OAuth credential status."""
+
+    authorized: bool
+    auth_file: str
+    email: Optional[str] = None
+    plan_type: Optional[str] = None
+    expires_at: Optional[float] = None
+    expires_in_seconds: Optional[int] = None
+    refreshable: Optional[bool] = None
+    reason: Optional[str] = None
+    message: Optional[str] = None
+
+
+class CodexOAuthLoginStartResponse(BaseModel):
+    """Device code the browser must show while the user authorizes."""
+
+    session_id: str
+    user_code: str
+    verification_url: str
+    interval_seconds: int
+    expires_at: float
+    state: str
+
+
+class CodexOAuthLoginSessionResponse(BaseModel):
+    """Polling result for one device-login session."""
+
+    session_id: str
+    state: str
+    user_code: Optional[str] = None
+    verification_url: Optional[str] = None
+    expires_at: Optional[float] = None
+    email: Optional[str] = None
+    plan_type: Optional[str] = None
+    last_refresh: Optional[str] = None
+    reason: Optional[str] = None
+    message: Optional[str] = None
 
 
 class SystemConfigValidationErrorResponse(BaseModel):

@@ -203,6 +203,33 @@ def _agent_event_monitor_interval_seconds(config: Config) -> int:
     return interval_minutes * 60
 
 
+def _decision_signal_outcome_interval_seconds(config: Config) -> int:
+    """Return the validated DecisionSignal outcome polling interval."""
+    interval_minutes = getattr(config, "decision_signal_outcome_interval_minutes", 360)
+    try:
+        interval_minutes = max(1, int(interval_minutes))
+    except (TypeError, ValueError):  # pragma: no cover - defensive branch
+        logger.warning(
+            "Invalid DECISION_SIGNAL_OUTCOME_INTERVAL_MINUTES=%r; use fallback 360",
+            interval_minutes,
+        )
+        interval_minutes = 360
+    return interval_minutes * 60
+
+
+def _decision_signal_outcome_batch_limit(config: Config) -> int:
+    """Return the bounded number of signals processed per maintenance run."""
+    batch_limit = getattr(config, "decision_signal_outcome_batch_limit", 500)
+    try:
+        return max(1, min(int(batch_limit), 500))
+    except (TypeError, ValueError):  # pragma: no cover - defensive branch
+        logger.warning(
+            "Invalid DECISION_SIGNAL_OUTCOME_BATCH_LIMIT=%r; use fallback 500",
+            batch_limit,
+        )
+        return 500
+
+
 def build_agent_event_monitor_background_tasks(
     config: Config,
     *,
@@ -232,6 +259,44 @@ def build_agent_event_monitor_background_tasks(
         "interval_seconds": interval_seconds,
         "run_immediately": True,
         "name": "agent_event_monitor",
+    }]
+
+
+def build_decision_signal_outcome_background_tasks(
+    config: Config,
+    *,
+    config_provider: Callable[[], Config],
+) -> List[Dict[str, Any]]:
+    """Build the idempotent signal-outcome maintenance task for schedule mode."""
+    if not getattr(config, "decision_signal_outcome_tracking_enabled", False):
+        return []
+
+    from src.services.decision_signal_outcome_service import DecisionSignalOutcomeService
+
+    try:
+        outcome_service = DecisionSignalOutcomeService()
+    except Exception as exc:  # pragma: no cover - defensive branch
+        logger.warning("Failed to initialize DecisionSignal outcome tracker: %s", exc)
+        return []
+
+    def outcome_task() -> None:
+        current_config = config_provider()
+        batch_limit = _decision_signal_outcome_batch_limit(current_config)
+        result = outcome_service.run_outcomes(limit=batch_limit)
+        logger.info(
+            "[DecisionSignalOutcome] evaluated=%d created=%d updated=%d skipped=%d limit=%d",
+            result.get("evaluated", 0),
+            result.get("created", 0),
+            result.get("updated", 0),
+            result.get("skipped", 0),
+            batch_limit,
+        )
+
+    return [{
+        "task": outcome_task,
+        "interval_seconds": _decision_signal_outcome_interval_seconds(config),
+        "run_immediately": True,
+        "name": "decision_signal_outcomes",
     }]
 
 
@@ -501,7 +566,10 @@ class RuntimeSchedulerService:
     def _current_background_tasks(self, config: Config) -> List[Dict[str, Any]]:
         if self._background_tasks_provider is not None:
             return self._background_tasks_provider(config)
-        return self._current_agent_event_monitor_background_tasks(config)
+        return [
+            *self._current_agent_event_monitor_background_tasks(config),
+            *self._current_decision_signal_outcome_background_tasks(config),
+        ]
 
     def _current_agent_event_monitor_background_tasks(self, config: Config) -> List[Dict[str, Any]]:
         name = "agent_event_monitor"
@@ -526,6 +594,45 @@ class RuntimeSchedulerService:
             interval_seconds = int(cached["interval_seconds"])
         else:
             interval_seconds = _agent_event_monitor_interval_seconds(config)
+
+        run_immediately = (
+            bool(cached.get("run_immediately", False))
+            and name not in self._background_task_registered_names
+        )
+        self._background_task_registered_names.add(name)
+        return [{
+            "task": cached["task"],
+            "interval_seconds": interval_seconds,
+            "run_immediately": run_immediately,
+            "name": name,
+        }]
+
+    def _current_decision_signal_outcome_background_tasks(
+        self,
+        config: Config,
+    ) -> List[Dict[str, Any]]:
+        name = "decision_signal_outcomes"
+        if not getattr(config, "decision_signal_outcome_tracking_enabled", False):
+            self._background_task_cache.pop(name, None)
+            self._background_task_registered_names.discard(name)
+            return []
+
+        cached = self._background_task_cache.get(name)
+        if cached is None:
+            entries = build_decision_signal_outcome_background_tasks(
+                config,
+                config_provider=self._reload_config,
+            )
+            if not entries:
+                self._background_task_cache.pop(name, None)
+                self._background_task_registered_names.discard(name)
+                return []
+            cached = dict(entries[0])
+            cached["name"] = name
+            self._background_task_cache[name] = cached
+            interval_seconds = int(cached["interval_seconds"])
+        else:
+            interval_seconds = _decision_signal_outcome_interval_seconds(config)
 
         run_immediately = (
             bool(cached.get("run_immediately", False))

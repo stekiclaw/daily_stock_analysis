@@ -321,6 +321,38 @@ sudo systemctl reload nginx
 
 配置成功后，直接用 `http://your-domain.com` 访问即可，不需要带端口号。
 
+### 挂在子路径下（例如 `https://your-domain.com/dsa/`）
+
+如果同一个域名下还有别的服务，可以把 DSA 挂在一个子路径上。浏览器侧的前缀（例如 `/dsa/`）
+必须在**构建时**告诉前端，否则打包出来的静态资源、路由和 API 请求仍然指向根路径：
+
+```bash
+# 构建时传入部署前缀（结尾的斜杠可有可无）
+docker compose build --build-arg VITE_BASE_PATH=/dsa/
+```
+
+对应的 Nginx 配置把前缀剥掉再转发给后端，后端仍然对外提供 `/api/...`：
+
+```nginx
+location /dsa/ {
+    # 结尾的斜杠是必需的：它让 Nginx 去掉 /dsa/ 前缀再转发
+    proxy_pass http://127.0.0.1:8000/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+}
+```
+
+不传 `VITE_BASE_PATH` 时默认按根路径 `/` 构建，行为与上面的配置完全一致。
+
+> **注意**：`VITE_BASE_PATH` 是构建参数而不是运行时环境变量。改了它必须重新构建镜像，
+> 只重启容器不会生效。
+
 > **使用 Nginx 后的注意事项**：
 > - 如果你开启了 Web 登录认证（`ADMIN_AUTH_ENABLED=true`），建议在 `.env` 中把 `TRUST_X_FORWARDED_FOR=true` 一并打开，否则系统可能无法正确识别真实 IP。该选项适用于**单层可信反向代理**（Nginx → App）部署；如果使用多级代理或 CDN（CDN → Nginx → App），登录限流的 key 可能退化为边缘代理 IP 而非真实客户端 IP，需根据实际拓扑评估。
 > - 如需 HTTPS，可以用 [Certbot](https://certbot.eff.org/) 自动申请免费的 Let's Encrypt 证书。

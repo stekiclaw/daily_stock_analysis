@@ -139,7 +139,10 @@ class TestAlphaVantageFetcherRealtimeQuote(unittest.TestCase):
         })
         quote = self.fetcher.get_realtime_quote('AAPL')
         self.assertIsNotNone(quote)
+        from data_provider.realtime_types import RealtimeSource
+
         self.assertEqual(quote.code, 'AAPL')
+        self.assertIs(quote.source, RealtimeSource.ALPHA_VANTAGE)
         self.assertAlmostEqual(quote.price, 150.0)
 
     def test_realtime_quote_non_us_stock(self):

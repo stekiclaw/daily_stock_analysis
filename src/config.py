@@ -43,6 +43,7 @@ from src.llm.backend_registry import (
     GENERATION_ONLY_BACKEND_IDS,
     LOCAL_CLI_GENERATION_BACKEND_IDS,
     LITELLM_BACKEND_ID,
+    NON_LITELLM_GENERATION_BACKEND_IDS,
     OPENCODE_CLI_BACKEND_ID,
     SUPPORTED_AGENT_GENERATION_BACKENDS,
     SUPPORTED_AGENT_UI_BACKENDS,
@@ -57,6 +58,11 @@ from src.llm.local_cli_backend import (
     MAX_LOCAL_CLI_BACKEND_MAX_CONCURRENCY,
     MAX_LOCAL_CLI_OUTPUT_BYTES,
     MAX_LOCAL_CLI_TIMEOUT_SECONDS,
+)
+from src.llm.codex_oauth import (
+    DEFAULT_AUTH_FILE as DEFAULT_CODEX_OAUTH_AUTH_FILE,
+    DEFAULT_EFFORT as CODEX_OAUTH_DEFAULT_EFFORT,
+    DEFAULT_MODEL as CODEX_OAUTH_DEFAULT_MODEL,
 )
 from src.llm import generation_params as llm_generation_params
 from src.llm.hermes import (
@@ -121,7 +127,7 @@ _FALLBACK_LITELLM_MODEL_PROVIDERS = _MANAGED_LITELLM_KEY_PROVIDERS | set(SUPPORT
 }
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off"}
 PROMPT_CACHE_DIAGNOSTICS_LEVELS = {"off", "basic", "debug"}
-SUPPORTED_AGENT_BACKENDS = {"auto", "litellm", "codex_app_server"}
+SUPPORTED_AGENT_BACKENDS = {"auto", "litellm", "codex_app_server", "codex_oauth"}
 TICKFLOW_KLINE_ADJUST_VALUES = {"none", "forward", "backward", "forward_additive", "backward_additive"}
 # Fallback defaults used when ANSPIRE_API_KEYS is reused as legacy OpenAI-compatible source.
 # These are compatibility examples; actual availability should be validated by Anspire console/model entitlement.
@@ -906,6 +912,13 @@ class Config:
     generation_backend_max_concurrency: int = DEFAULT_GENERATION_BACKEND_MAX_CONCURRENCY
     local_cli_backend_max_concurrency: int = DEFAULT_LOCAL_CLI_BACKEND_MAX_CONCURRENCY
     opencode_cli_model: str = ""
+    # Codex OAuth backend: credential path plus model/effort defaults.
+    codex_oauth_auth_file: str = DEFAULT_CODEX_OAUTH_AUTH_FILE
+    codex_oauth_model: str = CODEX_OAUTH_DEFAULT_MODEL
+    codex_oauth_reasoning_effort: str = CODEX_OAUTH_DEFAULT_EFFORT
+    # Ask-stock may run a different model than report generation; empty means
+    # inherit codex_oauth_model.
+    agent_codex_oauth_model: str = ""
     # LiteLLM unified model config (provider/model format, e.g. gemini/gemini-3.1-pro-preview)
     litellm_model: str = ""  # Primary model; must include provider prefix when set explicitly
     litellm_fallback_models: List[str] = field(default_factory=list)  # Cross-model fallback list
@@ -983,6 +996,8 @@ class Config:
     serpapi_keys: List[str] = field(default_factory=list)  # SerpAPI Keys
     searxng_base_urls: List[str] = field(default_factory=list)  # SearXNG instance URLs (self-hosted, no quota)
     searxng_public_instances_enabled: bool = False  # Opt in to public discovery when base URLs are absent
+    yfinance_news_enabled: bool = False  # Opt in to the keyless Yahoo Finance news fallback
+    etf_constituent_news_enabled: bool = False  # Opt in to the keyless ETF constituent news fallback
 
     # === Social Sentiment (US stocks only, api.adanos.org) ===
     social_sentiment_api_key: Optional[str] = None
@@ -1038,6 +1053,9 @@ class Config:
     agent_event_monitor_enabled: bool = False  # Enable periodic event-driven alert checks in schedule mode
     agent_event_monitor_interval_minutes: int = 5  # Polling interval for event monitor background checks
     agent_event_alert_rules_json: str = ""  # JSON array of serialized EventMonitor rules
+    decision_signal_outcome_tracking_enabled: bool = False  # Evaluate signal outcomes in schedule mode
+    decision_signal_outcome_interval_minutes: int = 360  # Outcome evaluator polling interval
+    decision_signal_outcome_batch_limit: int = 500  # Maximum signals evaluated per maintenance run
 
     # === 通知配置（可同时配置多个，全部推送）===
     
@@ -1321,6 +1339,11 @@ class Config:
     _BOOTSTRAP_RUNTIME_ENV_OVERRIDES_CAPTURED = False
     _BOOTSTRAP_RUNTIME_ENV_OVERRIDES = frozenset()
     _BOOTSTRAP_RUNTIME_ENV_PRESENT_KEYS = frozenset()
+    # Process environment as it looked before dotenv touched it. Kept private
+    # and only ever compared against, never returned, so callers cannot read
+    # credentials back out of it.
+    _BOOTSTRAP_PROCESS_ENV_SNAPSHOT = {}
+    _BOOTSTRAP_PROCESS_ENV_CAPTURED = False
 
     def __post_init__(self) -> None:
         _log = logging.getLogger(__name__)
@@ -1630,6 +1653,18 @@ class Config:
             os.getenv('AGENT_GENERATION_BACKEND', AUTO_AGENT_BACKEND_ID).strip().lower()
             or AUTO_AGENT_BACKEND_ID
         )
+        codex_oauth_auth_file = (
+            os.getenv('CODEX_OAUTH_AUTH_FILE', '').strip()
+            or DEFAULT_CODEX_OAUTH_AUTH_FILE
+        )
+        codex_oauth_model = (
+            os.getenv('CODEX_OAUTH_MODEL', '').strip() or CODEX_OAUTH_DEFAULT_MODEL
+        )
+        codex_oauth_reasoning_effort = (
+            os.getenv('CODEX_OAUTH_REASONING_EFFORT', '').strip().lower()
+            or CODEX_OAUTH_DEFAULT_EFFORT
+        )
+        agent_codex_oauth_model = os.getenv('AGENT_CODEX_OAUTH_MODEL', '').strip()
         generation_backend_timeout_seconds = parse_env_int(
             os.getenv('GENERATION_BACKEND_TIMEOUT_SECONDS'),
             DEFAULT_LOCAL_CLI_TIMEOUT_SECONDS,
@@ -1717,6 +1752,15 @@ class Config:
             )
         searxng_public_instances_enabled = parse_env_bool(
             os.getenv('SEARXNG_PUBLIC_INSTANCES_ENABLED'),
+            default=False,
+        )
+
+        yfinance_news_enabled = parse_env_bool(
+            os.getenv('YFINANCE_NEWS_ENABLED'),
+            default=False,
+        )
+        etf_constituent_news_enabled = parse_env_bool(
+            os.getenv('ETF_CONSTITUENT_NEWS_ENABLED'),
             default=False,
         )
 
@@ -1817,6 +1861,10 @@ class Config:
             generation_backend_max_concurrency=generation_backend_max_concurrency,
             local_cli_backend_max_concurrency=local_cli_backend_max_concurrency,
             opencode_cli_model=opencode_cli_model,
+            codex_oauth_auth_file=codex_oauth_auth_file,
+            codex_oauth_model=codex_oauth_model,
+            codex_oauth_reasoning_effort=codex_oauth_reasoning_effort,
+            agent_codex_oauth_model=agent_codex_oauth_model,
             litellm_model=litellm_model,
             litellm_fallback_models=litellm_fallback_models,
             llm_temperature=resolve_unified_llm_temperature(litellm_model),
@@ -1880,6 +1928,8 @@ class Config:
             serpapi_keys=serpapi_keys,
             searxng_base_urls=searxng_base_urls,
             searxng_public_instances_enabled=searxng_public_instances_enabled,
+            yfinance_news_enabled=yfinance_news_enabled,
+            etf_constituent_news_enabled=etf_constituent_news_enabled,
             social_sentiment_api_key=os.getenv('SOCIAL_SENTIMENT_API_KEY') or None,
             social_sentiment_api_url=os.getenv('SOCIAL_SENTIMENT_API_URL', 'https://api.adanos.org').rstrip('/'),
             news_max_age_days=parse_env_int(os.getenv('NEWS_MAX_AGE_DAYS'), 3, field_name='NEWS_MAX_AGE_DAYS', minimum=1),
@@ -2019,6 +2069,23 @@ class Config:
                 minimum=1,
             ),
             agent_event_alert_rules_json=os.getenv('AGENT_EVENT_ALERT_RULES_JSON', ''),
+            decision_signal_outcome_tracking_enabled=parse_env_bool(
+                os.getenv('DECISION_SIGNAL_OUTCOME_TRACKING_ENABLED'),
+                default=False,
+            ),
+            decision_signal_outcome_interval_minutes=parse_env_int(
+                os.getenv('DECISION_SIGNAL_OUTCOME_INTERVAL_MINUTES'),
+                360,
+                field_name='DECISION_SIGNAL_OUTCOME_INTERVAL_MINUTES',
+                minimum=1,
+            ),
+            decision_signal_outcome_batch_limit=parse_env_int(
+                os.getenv('DECISION_SIGNAL_OUTCOME_BATCH_LIMIT'),
+                500,
+                field_name='DECISION_SIGNAL_OUTCOME_BATCH_LIMIT',
+                minimum=1,
+                maximum=500,
+            ),
             wechat_webhook_url=os.getenv('WECHAT_WEBHOOK_URL'),
             feishu_webhook_url=os.getenv('FEISHU_WEBHOOK_URL'),
             feishu_webhook_secret=os.getenv('FEISHU_WEBHOOK_SECRET'),
@@ -2815,6 +2882,14 @@ class Config:
         do **not** flag the key, so that a later ``.env`` update by WebUI can
         take effect on config reload without requiring a container restart.
         """
+        if not cls._BOOTSTRAP_PROCESS_ENV_CAPTURED:
+            # Captured once per process and deliberately never refreshed: a
+            # WebUI save reloads with override=True, so on any later call
+            # os.environ already carries persisted-file values and they would
+            # be misread as process-injected ones.
+            cls._BOOTSTRAP_PROCESS_ENV_SNAPSHOT = dict(os.environ)
+            cls._BOOTSTRAP_PROCESS_ENV_CAPTURED = True
+
         if cls._BOOTSTRAP_RUNTIME_ENV_OVERRIDES_CAPTURED:
             return
 
@@ -2833,6 +2908,22 @@ class Config:
         cls._BOOTSTRAP_RUNTIME_ENV_OVERRIDES = frozenset(explicit_overrides)
         cls._BOOTSTRAP_RUNTIME_ENV_PRESENT_KEYS = frozenset(present_keys)
         cls._BOOTSTRAP_RUNTIME_ENV_OVERRIDES_CAPTURED = True
+
+    @classmethod
+    def bootstrap_process_env_shadows(cls, key: str, saved_value: str) -> bool:
+        """Whether a startup process env var will override ``saved_value`` on restart.
+
+        Docker ``env_file`` / ``environment:`` inject values into the process
+        environment. A WebUI save writes the persisted env file and reloads with
+        ``override=True``, so it applies to the running process - but the next
+        start re-injects the old process value, and the non-override dotenv load
+        cannot beat it. Settings uses this to warn instead of silently reverting.
+        """
+        cls._capture_bootstrap_runtime_env_overrides()
+        bootstrap_value = cls._BOOTSTRAP_PROCESS_ENV_SNAPSHOT.get(key)
+        if bootstrap_value is None:
+            return False
+        return bootstrap_value != (saved_value or "")
 
     @classmethod
     def _has_bootstrap_runtime_env_override(cls, key: str) -> bool:
@@ -3171,7 +3262,7 @@ class Config:
             issues.append(ConfigIssue(
                 severity="error",
                 message=(
-                    "AGENT_BACKEND 当前支持 auto、litellm、codex_app_server。"
+                    "AGENT_BACKEND 当前支持 auto、litellm、codex_app_server、codex_oauth。"
                     f"已配置的值为：{agent_backend}。"
                 ),
                 field="AGENT_BACKEND",
@@ -3235,7 +3326,7 @@ class Config:
         # Other LiteLLM-native providers (for example cohere/*) run through the
         # direct litellm env path and therefore do not populate llm_model_list.
         has_direct_env_model = bool(self.litellm_model) and _uses_direct_env_provider(self.litellm_model)
-        local_generation_backend = generation_backend in LOCAL_CLI_GENERATION_BACKEND_IDS
+        local_generation_backend = generation_backend in NON_LITELLM_GENERATION_BACKEND_IDS
         if not local_generation_backend and not self.llm_model_list and not has_direct_env_model:
             if self.litellm_config_path:
                 issues.append(ConfigIssue(

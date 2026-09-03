@@ -171,7 +171,7 @@ class SystemConfigApiTestCase(unittest.TestCase):
         backend_schema = item_map["AGENT_BACKEND"]["schema"]
         self.assertEqual(
             backend_schema["validation"]["enum"],
-            ["auto", "litellm", "codex_app_server"],
+            ["auto", "litellm", "codex_app_server", "codex_oauth"],
         )
         generation_schema = item_map["GENERATION_BACKEND"]["schema"]
         self.assertIn("claude_code_cli", generation_schema["validation"]["enum"])

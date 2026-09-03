@@ -449,22 +449,20 @@ class PipelineCountSemanticsTestCase(unittest.TestCase):
             "计数必须在发起检索之前置 0，否则整体失败时会落回 None",
         )
 
-    def test_post_hoc_persistence_query_does_not_write_the_count(self):
-        """分析结束后的补查只为持久化情报，绝不能回写计数。
-
-        它发生在 executor.run() 之后，与 Agent 实际消费的证据无关；用它做披露
-        判定会两个方向都失真（review OR-COR-5f5d7a2e）。真正的计数由
-        src/agent/news_evidence.py 的证据作用域收集。
-        """
+    def test_agent_pipeline_does_not_issue_a_post_hoc_news_query(self):
+        """工具已经持久化真实响应，分析后不得再查询另一组新闻冒充输入。"""
         src = self._read_pipeline_source()
-        idx = src.index("Agent 模式: 新闻情报已保存")
-        window = src[max(0, idx - 1200) : idx]
-        # 只看代码：解释这条约束的注释本身就含有该标识符。
+        agent_start = src.index("def _analyze_with_agent")
+        agent_end = src.index("def _agent_result_to_analysis_result", agent_start)
         code_only = "\n".join(
-            line for line in window.splitlines() if not line.strip().startswith("#")
+            line
+            for line in src[agent_start:agent_end].splitlines()
+            if not line.strip().startswith("#")
         )
 
-        self.assertNotIn("result.news_result_count", code_only)
+        self.assertNotIn("self.search_service.search_stock_news(", code_only)
+        self.assertIn("news_evidence.render_context()", code_only)
+        self.assertIn("news_content=agent_news_content", code_only)
 
 
 class _StubSearchResult:
@@ -578,6 +576,41 @@ class AgentNewsEvidenceTestCase(unittest.TestCase):
         self.assertEqual(5, len(post_hoc.results))
 
         self.assertEqual(0, self.accumulator.resolve(search_available=True))
+
+    def test_agent_evidence_retains_verifiable_content_for_history_snapshot(self):
+        from src.agent.tools.search_tools import _handle_search_stock_news
+
+        service = _StubSearchService(news_count=1)
+        self._install_service(service)
+
+        _handle_search_stock_news("MSFT", "Microsoft")
+
+        rendered = self.accumulator.render_context()
+        self.assertIsNotNone(rendered)
+        self.assertIn("标题0", rendered)
+        self.assertIn("摘要0", rendered)
+        self.assertIn("https://example.invalid/0", rendered)
+        self.assertTrue(self.accumulator.attempted)
+        self.assertEqual(1, len(self.accumulator.records))
+
+    def test_evidence_urls_drop_query_and_fragment_credentials(self):
+        self.news_evidence.record_news_evidence(
+            1,
+            results=[
+                {
+                    "title": "verified",
+                    "url": "https://example.com/item?token=secret#fragment",
+                }
+            ],
+            dimension="latest_news",
+            provider="UnitSearch",
+        )
+
+        rendered = self.accumulator.render_context()
+        self.assertIn("https://example.com/item", rendered)
+        self.assertNotIn("token=", rendered)
+        self.assertNotIn("secret", rendered)
+        self.assertNotIn("fragment", rendered)
 
     def test_failed_agent_search_records_zero_rather_than_nothing(self):
         """检索发起但失败，是「搜过但没拿到」，不是「未配置渠道」。"""

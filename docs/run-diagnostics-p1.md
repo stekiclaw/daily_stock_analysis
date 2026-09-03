@@ -29,6 +29,11 @@
 - `record_count`
 - `created_at`
 
+后续新增的可选字段（缺失时保持兼容）：
+
+- `cache_hit` / `stale_seconds`：命中缓存或本地存储的来源标记
+- `data_date`：缓存/本地存储数据对应的交易日（见 `docs/run-diagnostics-p2.md`）
+
 错误摘要会做基础脱敏，避免输出 token、API key、Authorization、Cookie、包含敏感参数的 webhook URL 等内容。
 
 ## 稳定性边界

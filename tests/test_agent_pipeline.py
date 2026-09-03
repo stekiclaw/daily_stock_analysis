@@ -1904,8 +1904,8 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             )
             self.assertIsNone(signal_payload)
 
-    def test_analyze_with_agent_uses_resolved_name_for_news_persistence(self):
-        """Should use resolved stock name from dashboard for search and DB persistence."""
+    def test_analyze_with_agent_does_not_issue_posthoc_news_query(self):
+        """Agent tool evidence must not be replaced by a second post-analysis query."""
         with patch('src.core.pipeline.get_config') as mock_config, \
              patch('src.core.pipeline.get_db'), \
              patch('src.core.pipeline.DataFetcherManager'), \
@@ -1955,12 +1955,7 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             mock_build_executor.return_value = mock_executor
             mock_agent_run.return_value = agent_result
 
-            news_response = MagicMock()
-            news_response.success = True
-            news_response.results = [{"title": "test"}]
-            news_response.query = "test query"
             pipeline.search_service.is_available = True
-            pipeline.search_service.search_stock_news.return_value = news_response
 
             result = pipeline._analyze_with_agent(
                 code="588200",
@@ -1973,14 +1968,8 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
 
             self.assertIsNotNone(result)
             self.assertEqual(result.name, "科创芯片ETF")
-            pipeline.search_service.search_stock_news.assert_called_once_with(
-                stock_code="588200",
-                stock_name="科创芯片ETF",
-                max_results=5
-            )
-            pipeline.db.save_news_intel.assert_called_once()
-            saved_kwargs = pipeline.db.save_news_intel.call_args.kwargs
-            self.assertEqual(saved_kwargs["name"], "科创芯片ETF")
+            pipeline.search_service.search_stock_news.assert_not_called()
+            pipeline.db.save_news_intel.assert_not_called()
 
     def test_analyze_with_agent_keeps_dashboard_top_level_fields_after_stability(self):
         """Decision stability downgrade in agent flow should sync dashboard and top-level decision fields."""
